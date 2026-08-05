@@ -1,5 +1,6 @@
 import { readNote, writeNote } from '@/lib/server/notes';
 import { PathError } from '@/lib/server/paths';
+import { flushSession, isPending, touchSession } from '@/lib/server/sessions';
 
 /**
  * Notes are addressed by their full repo-relative path, passed as a single
@@ -25,7 +26,16 @@ export async function GET(request: Request) {
   }
 }
 
-type SaveRequest = { path: string; content: string; baseHash: string };
+/**
+ * `flush` is the client saying "commit this now" rather than waiting out the
+ * idle window — Ctrl+S, navigating to another note, or the tab closing.
+ *
+ * Note that it flushes and does not *seal*: coming back to the note continues
+ * the same commit by amending it. Sealing on every navigation would turn the
+ * ordinary habit of popping over to another note and back into one commit per
+ * lookup.
+ */
+type SaveRequest = { path: string; content: string; baseHash: string; flush?: boolean };
 
 export async function PUT(request: Request) {
   let body: SaveRequest;
@@ -35,7 +45,7 @@ export async function PUT(request: Request) {
     return Response.json({ error: 'Body must be JSON.' }, { status: 400 });
   }
 
-  const { path, content, baseHash } = body ?? {};
+  const { path, content, baseHash, flush } = body ?? {};
   if (typeof path !== 'string' || typeof content !== 'string' || typeof baseHash !== 'string') {
     return Response.json(
       { error: 'Expected { path, content, baseHash } as strings.' },
@@ -59,7 +69,28 @@ export async function PUT(request: Request) {
         { status: 409 },
       );
     }
-    return Response.json({ hash: result.hash, title: result.title });
+    // The write above is the durability guarantee and is already complete. The
+    // commit is a second, slower promise, so a failure here must not report the
+    // save as failed — the bytes are safe either way.
+    let commit: string | null = null;
+    let commitError: string | null = null;
+    try {
+      // Always open/extend the session first: that is what records that this
+      // note has work not yet in history. Flushing only decides whether the
+      // commit happens now or after the idle window.
+      touchSession(path);
+      if (flush) commit = (await flushSession(path))?.short ?? null;
+    } catch (error) {
+      commitError = error instanceof Error ? error.message : 'Could not write to history.';
+    }
+
+    return Response.json({
+      hash: result.hash,
+      title: result.title,
+      commit,
+      commitError,
+      pending: isPending(path),
+    });
   } catch (error) {
     return failure(error);
   }

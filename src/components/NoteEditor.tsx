@@ -1,16 +1,64 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { markdown } from '@codemirror/lang-markdown';
+import { EditorView } from '@codemirror/view';
+import CodeMirror from '@uiw/react-codemirror';
+import { useRouter } from 'next/navigation';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import AmbiguousLinkOverlay from '@/components/editor/AmbiguousLinkOverlay';
+import LinksPanel from '@/components/editor/LinksPanel';
+import { linkDecorations, type AmbiguousLink } from '@/components/editor/linkDecorations';
 import { dirName } from '@/lib/paths';
+import { parseLinks } from '@/lib/links/parse';
+import { resolveLink } from '@/lib/links/resolve';
+
+/**
+ * Clears CodeMirror's own defaults (a light background, its own font stack)
+ * so the editing surface inherits the wrapper's Tailwind styling instead of
+ * introducing a second, separate theme system alongside the app's existing
+ * dark palette.
+ */
+const editorTheme = EditorView.theme(
+  {
+    // No forced height here on purpose: the editor sizes to its own
+    // content, and the *wrapper* around editor+LinksPanel scrolls as one
+    // region. Forcing height:100% on a short note left a dead gap between
+    // the last line and the panel, which read as the panel floating,
+    // pinned to the bottom of the screen.
+    '&': { backgroundColor: 'transparent' },
+    '.cm-scroller': { fontFamily: 'inherit' },
+    '.cm-content': {
+      fontFamily: 'inherit',
+      fontSize: 'inherit',
+      lineHeight: 'inherit',
+      padding: '1.5rem 2.5rem',
+      caretColor: 'currentColor',
+    },
+    '.cm-line': { padding: 0 },
+    '&.cm-focused': { outline: 'none' },
+    '.cm-gutters': { display: 'none' },
+  },
+  { dark: true },
+);
 
 /** Only what the browser needs. The server's `Note` also carries line endings. */
 type EditableNote = { path: string; title: string; content: string; hash: string };
+type NoteEntry = { path: string; title: string };
 
 type Status = 'clean' | 'editing' | 'saving' | 'onDisk' | 'committed' | 'error' | 'conflict';
 
 /** Long enough not to fire mid-word, short enough that nobody notices waiting. */
 const AUTOSAVE_DELAY_MS = 800;
+
+/**
+ * When to ask whether the commit has landed.
+ *
+ * The server commits after 15s of quiet. Nothing is in flight at that moment,
+ * so the pill would otherwise sit on "Saved to disk" forever even though the
+ * work reached history. One poll, slightly after the server's own window.
+ */
+const COMMIT_CHECK_MS = 16_000;
 
 /**
  * The editor and its autosave.
@@ -23,11 +71,21 @@ const AUTOSAVE_DELAY_MS = 800;
  * Keyed by note path upstream, so switching notes remounts it and no state can
  * leak between two files.
  */
-export default function NoteEditor({ note }: { note: EditableNote }) {
+export default function NoteEditor({
+  note,
+  notes,
+  repoFiles,
+}: {
+  note: EditableNote;
+  notes: NoteEntry[];
+  repoFiles: string[];
+}) {
+  const router = useRouter();
   const [content, setContent] = useState(note.content);
   const [status, setStatus] = useState<Status>('clean');
   const [commit, setCommit] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [ambiguous, setAmbiguous] = useState<{ link: AmbiguousLink; x: number; y: number } | null>(null);
 
   // Refs, not state: the debounce timer and the unmount flush need the newest
   // values without waiting for a re-render.
@@ -35,17 +93,19 @@ export default function NoteEditor({ note }: { note: EditableNote }) {
   const latest = useRef(note.content);
   const onDisk = useRef(note.content);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const commitCheck = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const save = useCallback(async () => {
+  const save = useCallback(async (flush = false) => {
     const pending = latest.current;
-    if (pending === onDisk.current) return;
+    if (pending === onDisk.current && !flush) return;
 
+    if (commitCheck.current) clearTimeout(commitCheck.current);
     setStatus('saving');
     try {
       const response = await fetch('/api/note', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: note.path, content: pending, baseHash: hash.current }),
+        body: JSON.stringify({ path: note.path, content: pending, baseHash: hash.current, flush }),
       });
       const data = await response.json();
 
@@ -62,11 +122,30 @@ export default function NoteEditor({ note }: { note: EditableNote }) {
 
       hash.current = data.hash;
       onDisk.current = pending;
-      setProblem(null);
+      setProblem(data.commitError ?? null);
       setCommit(data.commit ?? null);
+
       // Someone may have typed while the request was in flight.
-      if (latest.current !== pending) setStatus('editing');
-      else setStatus(data.commit ? 'committed' : 'onDisk');
+      if (latest.current !== pending) {
+        setStatus('editing');
+        return;
+      }
+      setStatus(data.commit ? 'committed' : 'onDisk');
+
+      // Not committed yet: the server is holding this note's session open and
+      // will write it to history once typing stops. Check back once.
+      if (!data.commit && data.pending) {
+        commitCheck.current = setTimeout(() => {
+          void fetch(`/api/note/status?path=${encodeURIComponent(note.path)}`)
+            .then((r) => r.json())
+            .then((state) => {
+              if (latest.current !== onDisk.current || state.pending || !state.commit) return;
+              setCommit(state.commit);
+              setStatus('committed');
+            })
+            .catch(() => undefined);
+        }, COMMIT_CHECK_MS);
+      }
     } catch {
       setStatus('error');
       setProblem('Could not reach the server.');
@@ -79,13 +158,57 @@ export default function NoteEditor({ note }: { note: EditableNote }) {
     setStatus('editing');
     setProblem(null);
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(save, AUTOSAVE_DELAY_MS);
+    timer.current = setTimeout(() => void save(), AUTOSAVE_DELAY_MS);
   };
 
+  // Ctrl+S flushes — it commits immediately instead of waiting out the idle
+  // window — but does not start a new commit. Plenty of people press it every
+  // few seconds out of habit, and treating that as a milestone would shred the
+  // log into a commit per reflex.
   const saveNow = useCallback(() => {
     if (timer.current) clearTimeout(timer.current);
-    void save();
+    void save(true);
   }, [save]);
+
+  // Recomputed on every keystroke — parsing+resolving one note's handful of
+  // links against ~40 paths is trivial, no debounce needed here (the
+  // CodeMirror decoration layer gets its own, for a different reason: it
+  // repaints the DOM, this just re-renders a list).
+  const links = useMemo(() => {
+    const notePaths = notes.map((n) => n.path);
+    return parseLinks(content).map((link) => resolveLink(note.path, link, { notePaths, repoFiles }));
+  }, [content, notes, repoFiles, note.path]);
+
+  const titleByPath = useMemo(() => new Map(notes.map((n) => [n.path, n.title])), [notes]);
+
+  // Deliberately excludes `content`: this only needs to change when the
+  // *set of notes/files to resolve against* changes, not on every
+  // keystroke — the decoration plugin re-parses the live doc itself, on its
+  // own debounce, once CodeMirror is holding this extension.
+  const linkCtx = useMemo(
+    () => ({
+      sourcePath: note.path,
+      notePaths: notes.map((n) => n.path),
+      repoFiles,
+      onNavigate: (path: string) => router.push(`/?path=${encodeURIComponent(path)}`),
+      onAmbiguous: (link: AmbiguousLink, coords: { x: number; y: number }) =>
+        setAmbiguous({ link, x: coords.x, y: coords.y }),
+    }),
+    [note.path, notes, repoFiles, router],
+  );
+
+  const editorExtensions = useMemo(
+    () => [
+      markdown(),
+      editorTheme,
+      linkDecorations(linkCtx),
+      EditorView.contentAttributes.of({
+        'aria-label': `Contents of ${note.path}`,
+        spellcheck: 'false',
+      }),
+    ],
+    [linkCtx, note.path],
+  );
 
   // Ctrl/Cmd-S saves now instead of waiting out the debounce. The browser's own
   // "save page" dialog is never what someone means inside a text editor.
@@ -100,19 +223,36 @@ export default function NoteEditor({ note }: { note: EditableNote }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [saveNow]);
 
-  // Leaving for another note must not drop the last few keystrokes.
-  // `keepalive` lets the request outlive the component.
+  // Leaving for another note, or closing the tab, must not drop the last few
+  // keystrokes — and must not leave the work sitting outside history either.
+  // `keepalive` lets the request outlive the component; `flush` tells the
+  // server to commit rather than start a 15s timer nobody is waiting on.
   useEffect(() => {
     const path = note.path;
-    return () => {
-      if (timer.current) clearTimeout(timer.current);
-      if (latest.current === onDisk.current) return;
+    const flushOut = () => {
       void fetch('/api/note', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path, content: latest.current, baseHash: hash.current }),
+        body: JSON.stringify({
+          path,
+          content: latest.current,
+          baseHash: hash.current,
+          flush: true,
+        }),
         keepalive: true,
       });
+    };
+
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') flushOut();
+    };
+    document.addEventListener('visibilitychange', onHide);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onHide);
+      if (timer.current) clearTimeout(timer.current);
+      if (commitCheck.current) clearTimeout(commitCheck.current);
+      flushOut();
     };
   }, [note.path]);
 
@@ -128,13 +268,43 @@ export default function NoteEditor({ note }: { note: EditableNote }) {
 
       <div className="mx-10 border-t border-line" />
 
-      <textarea
-        value={content}
-        onChange={(event) => onChange(event.target.value)}
-        spellCheck={false}
-        className="min-h-0 flex-1 resize-none bg-transparent px-10 py-6 font-mono text-sm leading-relaxed text-neutral-200 outline-none"
-        aria-label={`Contents of ${note.path}`}
-      />
+      {/* Editor text and the Links panel scroll together as one region, so
+          the panel sits right after the note's actual content instead of
+          being pinned to the bottom of the viewport on a short note. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <CodeMirror
+          value={content}
+          onChange={(value) => onChange(value)}
+          theme="none"
+          basicSetup={{
+            lineNumbers: false,
+            foldGutter: false,
+            highlightActiveLine: false,
+            highlightActiveLineGutter: false,
+            autocompletion: false,
+            closeBrackets: false,
+            bracketMatching: false,
+          }}
+          extensions={editorExtensions}
+          className="text-sm leading-relaxed text-neutral-200"
+          style={{ fontFamily: 'var(--font-mono)' }}
+        />
+
+        <LinksPanel links={links} notes={notes} />
+      </div>
+
+      {ambiguous && (
+        <AmbiguousLinkOverlay
+          x={ambiguous.x}
+          y={ambiguous.y}
+          target={ambiguous.link.target}
+          candidates={ambiguous.link.candidates.map((path) => ({
+            path,
+            title: titleByPath.get(path) ?? path,
+          }))}
+          onDismiss={() => setAmbiguous(null)}
+        />
+      )}
     </div>
   );
 }

@@ -32,6 +32,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...except the template, which is how a reviewer points the app at their own
+# clone of the notes repo. Ignoring it would break the documented setup.
+!.env.example
 
 # vercel
 .vercel

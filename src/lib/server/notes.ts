@@ -1,0 +1,111 @@
+import 'server-only';
+
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+
+import { titleFor } from '../titles';
+import { PathError, resolveInRepo } from './paths';
+
+/** Line endings, preserved per file. See `readNote`. */
+export type Eol = '\r\n' | '\n';
+
+export type Note = {
+  path: string;
+  title: string;
+  /** Always LF, whatever is on disk. */
+  content: string;
+  /** SHA-256 of the bytes on disk, not of `content`. */
+  hash: string;
+  eol: Eol;
+};
+
+/**
+ * Identifies a note's exact on-disk state, so a save can prove it is editing
+ * the version it was handed. Taken over the raw bytes rather than the decoded
+ * string: two different byte sequences must never produce the same hash just
+ * because they render the same.
+ */
+export function hashOf(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * Notes live under `notes/`. `resolveInRepo` already refuses anything outside
+ * the repo; this narrows it further so the note endpoints cannot be aimed at
+ * `README.md` or `.noteindex.json`, which the app manages by other means.
+ */
+function resolveNote(relPath: string): string {
+  const clean = relPath.replace(/\\/g, '/');
+  if (clean !== 'notes' && !clean.startsWith('notes/')) {
+    throw new PathError(`Not a note: ${relPath}`);
+  }
+  return resolveInRepo(clean);
+}
+
+/**
+ * This repo is checked out with `core.autocrlf=true`, so all 36 files are CRLF
+ * on disk while git stores LF. A browser `<textarea>` normalises its value to
+ * LF, so a naive read/write round-trip would rewrite every line of every file
+ * we touch and turn each real edit into a whole-file diff.
+ *
+ * So: normalise to LF on the way out, restore the file's own ending on the way
+ * back in. The app never decides what line endings a file should have — it
+ * only preserves what it found.
+ */
+function detectEol(text: string): Eol {
+  return text.includes('\r\n') ? '\r\n' : '\n';
+}
+
+function toEol(content: string, eol: Eol): string {
+  return eol === '\r\n' ? content.replace(/\r?\n/g, '\r\n') : content.replace(/\r\n/g, '\n');
+}
+
+export async function readNote(relPath: string): Promise<Note> {
+  const bytes = await fs.readFile(resolveNote(relPath));
+  const raw = bytes.toString('utf8');
+  const eol = detectEol(raw);
+  const content = raw.replace(/\r\n/g, '\n');
+
+  return { path: relPath, title: titleFor(relPath, content), content, hash: hashOf(bytes), eol };
+}
+
+export type SaveResult =
+  | { ok: true; hash: string; title: string }
+  | { ok: false; reason: 'conflict'; currentHash: string; currentContent: string };
+
+/**
+ * Write a note back to disk, but only if it still looks the way the caller was
+ * told it looked.
+ *
+ * `baseHash` is what makes two tabs safe: the second save arrives holding a
+ * hash of the content it started from, which no longer matches the file the
+ * first save produced, so it is refused instead of overwriting. What the user
+ * sees when that happens is a separate question from this function.
+ *
+ * This is the durability layer only — it puts bytes on disk and does not
+ * commit. Committing is a separate decision about *when*, deliberately not
+ * wired into the write path.
+ */
+export async function writeNote(
+  relPath: string,
+  content: string,
+  baseHash: string,
+): Promise<SaveResult> {
+  const abs = resolveNote(relPath);
+  const current = await fs.readFile(abs);
+  const currentHash = hashOf(current);
+
+  if (currentHash !== baseHash) {
+    return {
+      ok: false,
+      reason: 'conflict',
+      currentHash,
+      currentContent: current.toString('utf8').replace(/\r\n/g, '\n'),
+    };
+  }
+
+  const bytes = Buffer.from(toEol(content, detectEol(current.toString('utf8'))), 'utf8');
+  await fs.writeFile(abs, bytes);
+
+  return { ok: true, hash: hashOf(bytes), title: titleFor(relPath, content) };
+}

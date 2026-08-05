@@ -28,7 +28,7 @@ async function lsFiles(flags: string[]): Promise<string[]> {
  *
  * Within that constraint there is no filtering at all: no extension whitelist,
  * no name patterns, dotfiles and hidden folders included. That is what keeps
- * `notes/drafts/.scratch/temp-debug-notes.md` and the six non-`.md` files in.
+ * `notes/drafts/.scratch/temp-debug-notes.md` and the five non-`.md` files in.
  */
 export async function listNoteFiles(): Promise<string[]> {
   return lsFiles(['--cached', '--others', '--exclude-standard']);

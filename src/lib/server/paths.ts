@@ -47,15 +47,3 @@ export function resolveInRepo(relPath: string): string {
 export function toRepoRelative(abs: string): string {
   return path.relative(NOTES_ROOT, abs).split(path.sep).join('/');
 }
-
-/** Extension, lowercased, from the LAST dot — `2025.07.15.retro.md` is `.md`. */
-export function extensionOf(relPath: string): string {
-  return path.extname(relPath).toLowerCase();
-}
-
-/** Filename with its extension stripped. Used for the index title fallback. */
-export function stemOf(relPath: string): string {
-  const base = path.basename(relPath);
-  const ext = path.extname(base);
-  return ext ? base.slice(0, -ext.length) : base;
-}

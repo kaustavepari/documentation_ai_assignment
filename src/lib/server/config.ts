@@ -23,6 +23,13 @@ export const NOTES_DIR = path.join(NOTES_ROOT, 'notes');
 /** The index file the app must keep in sync with the filesystem. */
 export const INDEX_FILE = path.join(NOTES_ROOT, '.noteindex.json');
 
+/**
+ * The same file as a git pathspec. Git wants repo-relative forward slashes;
+ * `INDEX_FILE` is absolute and, on Windows, backslashed — passing that to
+ * `git add` is asking for trouble.
+ */
+export const INDEX_PATHSPEC = '.noteindex.json';
+
 export type RepoCheck =
   | { ok: true; root: string }
   | { ok: false; root: string; problem: string };

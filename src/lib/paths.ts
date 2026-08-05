@@ -46,3 +46,33 @@ export function stemOf(relPath: string): string {
   const dot = base.lastIndexOf('.');
   return dot <= 0 ? base : base.slice(0, dot);
 }
+
+/**
+ * Joins and normalizes a POSIX relative path, resolving `.` and `..`
+ * segments — pure string math, no filesystem access. This is the
+ * client-safe counterpart to `resolveInRepo`'s traversal handling in
+ * `lib/server/paths.ts`, which throws and needs `node:path`/`fs`, so it
+ * isn't reused directly.
+ *
+ * May resolve outside `fromDir` entirely, including above it — a relative
+ * markdown link from a note into `assets/` does exactly that, and excess
+ * `..` segments simply run out (matching how a browser resolves a relative
+ * href with more `../` than the source path has levels). This function only
+ * computes the resulting path string; it does not judge whether that path
+ * is allowed to exist.
+ */
+export function resolveRelativePath(fromDir: string, target: string): string {
+  const combined = fromDir ? `${fromDir}/${target}` : target;
+  const resolved: string[] = [];
+
+  for (const segment of combined.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      resolved.pop();
+      continue;
+    }
+    resolved.push(segment);
+  }
+
+  return resolved.join('/');
+}

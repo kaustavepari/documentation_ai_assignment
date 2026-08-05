@@ -3,6 +3,7 @@ import NoteTree from '@/components/NoteTree';
 import { checkRepo } from '@/lib/server/config';
 import { listNotes } from '@/lib/server/index-file';
 import { readNote } from '@/lib/server/notes';
+import { listOutsideNotes } from '@/lib/server/walk';
 import { buildTree } from '@/lib/tree';
 
 /**
@@ -21,8 +22,9 @@ export default async function Home(props: PageProps<'/'>) {
   const { path } = await props.searchParams;
   const selected = typeof path === 'string' ? path : undefined;
 
-  const notes = await listNotes();
+  const [notes, otherFiles] = await Promise.all([listNotes(), listOutsideNotes()]);
   const tree = buildTree(notes);
+  const repoFiles = [...notes.map((n) => n.path), ...otherFiles];
 
   let note = null;
   let openError: string | null = null;
@@ -48,7 +50,7 @@ export default async function Home(props: PageProps<'/'>) {
         {note ? (
           // Keyed by path so switching notes gives a fresh editor rather than
           // one holding the previous note's unsaved text.
-          <NoteEditor key={note.path} note={note} />
+          <NoteEditor key={note.path} note={note} notes={notes} repoFiles={repoFiles} />
         ) : (
           <Empty message={openError} />
         )}

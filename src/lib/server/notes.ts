@@ -52,11 +52,11 @@ function resolveNote(relPath: string): string {
  * back in. The app never decides what line endings a file should have — it
  * only preserves what it found.
  */
-function detectEol(text: string): Eol {
+export function detectEol(text: string): Eol {
   return text.includes('\r\n') ? '\r\n' : '\n';
 }
 
-function toEol(content: string, eol: Eol): string {
+export function toEol(content: string, eol: Eol): string {
   return eol === '\r\n' ? content.replace(/\r?\n/g, '\r\n') : content.replace(/\r\n/g, '\n');
 }
 

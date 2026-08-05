@@ -54,6 +54,26 @@ export function NoteIcon({ className }: IconProps) {
   );
 }
 
+/** Triangle + exclamation. Shared by broken and ambiguous links — both mean
+ *  "needs attention"; the distinction is color and wording, not icon. */
+export function WarningIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M8 2L14.5 13H1.5L8 2Z" strokeLinecap="round" />
+      <path d="M8 6.5V9.5" strokeLinecap="round" />
+      <circle cx="8" cy="11.5" r="0.75" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function ChevronIcon({ className }: IconProps) {
   return (
     <svg

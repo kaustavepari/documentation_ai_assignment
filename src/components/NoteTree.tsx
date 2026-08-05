@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import { ChevronIcon, FolderIcon, FolderOpenIcon, NoteIcon } from '@/components/icons';
 import { ancestorsOf, type TreeNode } from '@/lib/tree';
@@ -24,21 +24,30 @@ export default function NoteTree({ nodes, selected }: { nodes: TreeNode[]; selec
   // Everything starts open: the whole tree fits, and the hidden `.scratch`
   // folder should be visible on arrival rather than something to go hunting for.
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [revealed, setRevealed] = useState(selected);
 
   // Opening a deep note reveals it, even if its folder was collapsed.
   //
-  // This has to *change* the collapsed set rather than override it at render
-  // time: forcing the open note's ancestors open on every render would make
-  // them impossible to collapse, since the click would update state that the
-  // render then ignored.
-  useEffect(() => {
-    if (!selected) return;
-    setCollapsed((previous) => {
-      const next = new Set(previous);
-      const opened = ancestorsOf(selected).filter((folder) => next.delete(folder));
-      return opened.length > 0 ? next : previous;
-    });
-  }, [selected]);
+  // Two constraints pull against each other here. It has to *change* the
+  // collapsed set rather than override it at render time: forcing the open
+  // note's ancestors open on every render would make them impossible to
+  // collapse, since the click would update state that the render then ignored.
+  // But it also cannot be an effect, because that renders once with the folder
+  // still shut and again with it open.
+  //
+  // Adjusting state during render when a prop changes is the sanctioned answer
+  // to exactly this: React discards the in-progress render and redoes it before
+  // touching the DOM, so there is no flash and no cascading re-render.
+  if (selected !== revealed) {
+    setRevealed(selected);
+    if (selected) {
+      setCollapsed((previous) => {
+        const next = new Set(previous);
+        const opened = ancestorsOf(selected).filter((folder) => next.delete(folder));
+        return opened.length > 0 ? next : previous;
+      });
+    }
+  }
 
   const toggle = (path: string) =>
     setCollapsed((previous) => {

@@ -3,7 +3,9 @@
 Updated at the end of each build phase. Everything below is decided, built, and
 verified — not planned. Sections appear as the work that justifies them lands.
 
-**Current state: end of Phase 0 (scaffold + server boundary).**
+**Current state: the tree, opening a note, editing and saving to disk all work.
+Saves do not become commits yet — when a save becomes a commit is the next
+decision, and the one the brief weights most heavily.**
 
 ---
 
@@ -33,9 +35,10 @@ Two conditions, and the second is the interesting one.
 
 **Inside `notes/`, I filter nothing by name or type.** No extension whitelist,
 no filename patterns, dotfiles and hidden folders included. This is what keeps
-`notes/drafts/.scratch/temp-debug-notes.md` in, along with the six files that
-are not `.md` (`.markdown`, `.mdx`, `.org`, `.txt`, and the uppercase `.MD`).
-There is no list of "file types I skip" — there is no such list at all.
+`notes/drafts/.scratch/temp-debug-notes.md` in, along with the five files that
+are not `.md` (`.markdown`, `.mdx`, `.org`, `.txt`, and the uppercase `.MD` —
+31 of the 36 are plain `.md`). There is no list of "file types I skip" — there
+is no such list at all.
 
 **The junk question is delegated to the repo's own `.gitignore`, not to a
 blocklist I write.** The note list comes from
@@ -114,8 +117,55 @@ Git invocations are limited to one at a time. The app is a single process, so
 serialising there is enough to stop two concurrent requests from interleaving
 staging and commits.
 
+## The title rule was reverse-engineered, not invented
+
+`.noteindex.json` already had 36 correct titles, so the rule was there to be
+found rather than chosen:
+
+1. YAML frontmatter with a top-level `title:` — use it verbatim.
+2. Otherwise — the filename with its extension stripped, untransformed. No
+   title-casing, no dash-to-space.
+
+Only YAML frontmatter counts. `notes/drafts/experiment-final-log.org` opens
+with Org-mode's `#+TITLE: Experiment Log`, and the index still calls it
+`experiment-final-log` — so the fallback is triggered by the *absence of
+frontmatter*, not the absence of a title. Reading the `.org` header would have
+looked more thorough and would have been wrong.
+
+Checked by running the implementation against all 36 index entries: every one
+matches. That check is what caught the `.org` case.
+
+## Saves carry a hash of the bytes they started from
+
+Every save sends a fingerprint of the file as it was when the editor opened it
+— a SHA-256 of the exact bytes. The server re-reads the file before writing and
+compares. If the fingerprint still matches, nobody else touched the note and
+the write goes ahead. If it does not, the note changed underneath this editor,
+so the save is refused and the server hands back the current text instead of
+overwriting.
+
+The fingerprint is taken over the raw bytes rather than the decoded string, so
+two different byte sequences can never look identical just because they render
+the same.
+
+This is the detection half of Rule 2, and it is in the save path from its first
+version rather than retrofitted — a save endpoint without it has the wrong
+shape, and adding it later would mean changing every caller. What the user sees
+and can do when it fires is built on top of this.
+
+## Typing saves the note by itself
+
+Editing writes to disk 800ms after the last keystroke — long enough not to fire
+mid-word, short enough that nobody notices waiting. `Ctrl`/`Cmd-S` skips the
+wait for anyone who reaches for it out of habit. Leaving a note flushes
+whatever is still pending, using a request that outlives the component, so the
+last few keystrokes cannot be lost by clicking away.
+
+The user is never asked to press Save, but is always told where their work
+stands: the header shows whether the app is idle, writing, or done.
+
 ---
 
-*Still to be decided, in the phases that produce them: when to commit, how to
-handle two tabs editing at once, how renames treat links, and how delete and
-undo behave.*
+*Still to be decided, in the phases that produce them: when a save becomes a
+commit, what the user sees and can do when two tabs collide, how renames treat
+links, and how delete and undo behave.*

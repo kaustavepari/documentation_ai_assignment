@@ -4,11 +4,13 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 
 import DeleteConfirmDialog from '@/components/DeleteConfirmDialog';
-import { PlusFileIcon, PlusFolderIcon } from '@/components/icons';
+import { PlusFileIcon, PlusFolderIcon, TrashIcon } from '@/components/icons';
 import LinkImpactModal from '@/components/LinkImpactModal';
 import MoveToDialog from '@/components/MoveToDialog';
 import NoteTree, { type PendingCreate } from '@/components/NoteTree';
 import RowContextMenu from '@/components/RowContextMenu';
+import Toast from '@/components/Toast';
+import TrashPanel, { type TrashEntry } from '@/components/TrashPanel';
 import type { FixableLink, UnfixableLink } from '@/lib/links/rewrite';
 import type { Backlink } from '@/lib/links/types';
 import { dirName, baseName, renameVerb } from '@/lib/paths';
@@ -97,6 +99,15 @@ export default function AppShell({
   // trigger (unlike rename's link-impact modal, which fast-paths when
   // nothing's affected): deleting is destructive regardless of impact.
   const [deleteTarget, setDeleteTarget] = useState<DeleteState | null>(null);
+  // The undo toast for the delete that just happened — cleared by its own
+  // timer, a manual dismiss, or a successful undo.
+  const [toast, setToast] = useState<{ sha: string; title: string } | null>(null);
+  const [trashOpen, setTrashOpen] = useState(false);
+  // Shared between the toast's Undo button and the Trash panel's per-row
+  // Restore button — both funnel through the same restore call, so there's
+  // only ever one restore in flight regardless of which one triggered it.
+  const [restoringSha, setRestoringSha] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   // Both graduate to real the moment the server-fetched tree already
   // contains them — drop the ephemeral copy rather than showing it twice.
@@ -243,8 +254,9 @@ export default function AppShell({
     const { path } = deleteTarget;
     setDeleteTarget({ ...deleteTarget, busy: true, error: null });
     try {
-      await requestJson('/api/note/delete', { path });
+      const result = await requestJson<{ sha: string; title: string }>('/api/note/delete', { path });
       setDeleteTarget(null);
+      setToast({ sha: result.sha, title: result.title });
       if (selected === path) {
         router.push('/');
       } else {
@@ -254,6 +266,25 @@ export default function AppShell({
       setDeleteTarget((prev) =>
         prev ? { ...prev, busy: false, error: error instanceof Error ? error.message : 'Delete failed.' } : prev,
       );
+    }
+  };
+
+  // Shared by the toast's Undo button and the Trash panel's Restore button —
+  // returns whether it succeeded so each caller can update its own UI (the
+  // panel drops the row, the toast just closes) without duplicating the call.
+  const performRestore = async (sha: string): Promise<boolean> => {
+    setRestoringSha(sha);
+    setRestoreError(null);
+    try {
+      await requestJson('/api/note/restore', { sha });
+      setRestoringSha(null);
+      setToast((prev) => (prev?.sha === sha ? null : prev));
+      router.refresh();
+      return true;
+    } catch (error) {
+      setRestoringSha(null);
+      setRestoreError(error instanceof Error ? error.message : 'Restore failed.');
+      return false;
     }
   };
 
@@ -283,6 +314,15 @@ export default function AppShell({
               className="rounded p-1 text-neutral-400 hover:bg-white/5 hover:text-neutral-200"
             >
               <PlusFolderIcon className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setTrashOpen(true)}
+              title="Trash"
+              aria-label="Trash"
+              className="rounded p-1 text-neutral-400 hover:bg-white/5 hover:text-neutral-200"
+            >
+              <TrashIcon className="size-4" />
             </button>
           </div>
         </div>
@@ -360,6 +400,25 @@ export default function AppShell({
           error={deleteTarget.error}
           onConfirm={confirmDelete}
           onCancel={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {toast && (
+        <Toast
+          title={toast.title}
+          busy={restoringSha === toast.sha}
+          error={restoreError}
+          onUndo={() => performRestore(toast.sha)}
+          onDismiss={() => setToast(null)}
+        />
+      )}
+
+      {trashOpen && (
+        <TrashPanel
+          restoringSha={restoringSha}
+          error={restoreError}
+          onRestore={(entry: TrashEntry) => performRestore(entry.sha)}
+          onCancel={() => setTrashOpen(false)}
         />
       )}
     </div>

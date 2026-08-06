@@ -4,9 +4,9 @@ Updated at the end of each build phase. Everything below is decided, built, and
 verified — not planned. Sections appear as the work that justifies them lands.
 
 **Current state: the tree, opening a note, editing and saving to disk all work,
-with concurrent-edit detection and crash recovery. Create and Rename
-(including link-aware rename/move) are built. Delete and undo are the
-remaining rules.**
+with concurrent-edit detection and crash recovery. Create, Rename (including
+link-aware rename/move), Delete, and Undo (toast + a persistent Trash view,
+both backed by `git revert`) are all built. All six CRUD/undo rules are done.**
 
 ---
 
@@ -267,11 +267,13 @@ its real filename carries. **Decision: detect and surface both, do not
 silently rewrite content the user never touched.** Fixing content nobody
 asked to change is a worse failure than leaving a link visibly broken.
 
-This layer is built and correct against all ten links in the dataset, but
-nothing consumes it yet beyond the read-only backlinks panel — there is no
-rename or move operation in the app for it to protect. It exists now because
-retrofitting link-awareness into a rename implemented without it later would
-mean redoing the rename, not just adding a check on top.
+This layer is what rename and move are built on: every affected link is
+classified as either *fixable* (points directly at the note being moved —
+safe to rewrite by construction, since a full repo-relative path can't
+collide) or *unfixable* (an unrelated link elsewhere that this move would
+make newly ambiguous). Only the unfixable case ever needs a person — if a
+move touches nothing but fixable links, it goes straight through with no
+dialog at all.
 
 ## The sidebar and link lists show filenames, not titles — reversed from the first pass
 

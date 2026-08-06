@@ -8,7 +8,7 @@ import LinkImpactModal from '@/components/LinkImpactModal';
 import NoteTree, { type PendingCreate } from '@/components/NoteTree';
 import RowContextMenu from '@/components/RowContextMenu';
 import type { FixableLink, UnfixableLink } from '@/lib/links/rewrite';
-import { dirName, baseName } from '@/lib/paths';
+import { dirName, baseName, renameVerb } from '@/lib/paths';
 import { filePathsOf, folderPathsOf, withClientFile, withClientFolder, type TreeNode } from '@/lib/tree';
 
 type LinkImpactState = {
@@ -125,27 +125,34 @@ export default function AppShell({
     }
   };
 
-  const confirmRename = async (name: string) => {
-    const oldPath = renamingPath;
-    if (!oldPath) return;
-    setRenamingPath(null);
-
-    const newPath = `${dirName(oldPath)}/${name}`;
+  // The one entry point for "change this note's path," shared by inline
+  // rename and (later) drag-and-drop and the Move-to dialog — each just
+  // computes a different `newPath` and calls this. Checks link impact first;
+  // nothing unfixable means nothing here needs a human call (a fixable link
+  // is safe by construction, see rewrite.ts), so it proceeds straight
+  // through, rewriting whatever's fixable — which may be nothing at all.
+  const attemptMove = async (oldPath: string, newPath: string) => {
     if (newPath === oldPath) return;
-
     try {
       const plan = await requestJson<{ fixable: FixableLink[]; unfixable: UnfixableLink[] }>(
         '/api/note/link-impact',
         { oldPath, newPath },
       );
-      if (plan.fixable.length === 0 && plan.unfixable.length === 0) {
-        await performRename(oldPath, newPath, false);
+      if (plan.unfixable.length === 0) {
+        await performRename(oldPath, newPath, plan.fixable.length > 0);
         return;
       }
       setLinkImpact({ oldPath, newPath, ...plan, busy: false, error: null });
     } catch (error) {
-      setRenameError(error instanceof Error ? error.message : 'Rename failed.');
+      setRenameError(error instanceof Error ? error.message : `${renameVerb(oldPath, newPath)} failed.`);
     }
+  };
+
+  const confirmRename = (name: string) => {
+    const oldPath = renamingPath;
+    if (!oldPath) return;
+    setRenamingPath(null);
+    attemptMove(oldPath, `${dirName(oldPath)}/${name}`);
   };
 
   const resolveLinkImpact = async (rewriteLinks: boolean) => {
@@ -231,6 +238,7 @@ export default function AppShell({
 
       {linkImpact && (
         <LinkImpactModal
+          oldPath={linkImpact.oldPath}
           newPath={linkImpact.newPath}
           fixable={linkImpact.fixable}
           unfixable={linkImpact.unfixable}

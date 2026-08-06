@@ -3,7 +3,7 @@ import 'server-only';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { baseName, dirName, isCaseOnlyRename } from '../paths';
+import { baseName, dirName, isCaseOnlyRename, renameVerb } from '../paths';
 import { applySplices, buildSplicesForFile, planLinkRewrite } from '../links/rewrite';
 import { INDEX_PATHSPEC } from './config';
 import { commitPaths, headSha, shortSha, stagePaths, subject } from './commit';
@@ -132,21 +132,9 @@ async function rollbackStructural(existedAtHead: string[], newOnly: string[]): P
 }
 
 function composeRenameMessage(title: string, oldPath: string, newPath: string, rewrittenFiles: string[]): string {
-  const sameDir = dirName(oldPath) === dirName(newPath);
-  const sameName = baseName(oldPath) === baseName(newPath);
-
-  let verb: string;
-  let dest: string;
-  if (sameDir) {
-    verb = 'Rename';
-    dest = baseName(newPath);
-  } else if (sameName) {
-    verb = 'Move';
-    dest = `${dirName(newPath)}/`;
-  } else {
-    verb = 'Move and rename';
-    dest = newPath;
-  }
+  const verb = renameVerb(oldPath, newPath);
+  const dest =
+    verb === 'Rename' ? baseName(newPath) : verb === 'Move' ? `${dirName(newPath)}/` : newPath;
 
   const linkCount = rewrittenFiles.length;
   const suffix = linkCount > 0 ? ` (${linkCount} link${linkCount === 1 ? '' : 's'} updated)` : '';

@@ -106,6 +106,20 @@ export function relativePath(fromDir: string, toPath: string): string {
   return [...ups, ...toSegments.slice(common)].join('/');
 }
 
+/**
+ * "Rename" (same folder), "Move" (same filename, different folder), or
+ * "Move and rename" (both) — the verb this operation reads as, computed once
+ * so the commit message (`server/structural.ts`) and the link-impact modal
+ * can never drift apart on what to call the same operation.
+ */
+export function renameVerb(oldPath: string, newPath: string): 'Rename' | 'Move' | 'Move and rename' {
+  const sameDir = dirName(oldPath) === dirName(newPath);
+  const sameName = baseName(oldPath) === baseName(newPath);
+  if (sameDir) return 'Rename';
+  if (sameName) return 'Move';
+  return 'Move and rename';
+}
+
 /** `oldPath` and `newPath` differ only in case — the Windows/macOS trap where
  *  a naive single `git mv` can silently no-op on a case-insensitive
  *  filesystem. See DECISIONS.md's case-only-rename section. */

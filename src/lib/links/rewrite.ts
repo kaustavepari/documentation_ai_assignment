@@ -71,7 +71,7 @@ export function planLinkRewrite(
           sourceTitle: titleByPath.get(sourcePath) ?? sourcePath,
           type: link.type,
           raw: link.raw,
-          reason: `Would newly match ${after.candidates.length} notes after this move`,
+          reason: `Would make "${link.target}" ambiguous — it would then match ${after.candidates.length} notes instead of 1`,
         });
       }
     }

@@ -12,8 +12,13 @@ const EXTERNAL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:|^\/\//;
  * `notes/work/meetings/2025.07.15.retro.md` -> `notes/work/meetings/2025.07.15.retro`.
  * Only the last segment's extension is stripped — matches `stemOf`'s "last
  * dot" rule, applied to a full path rather than just a filename.
+ *
+ * Exported: a rename/move rewrites a wiki link's target to the note's new
+ * path with its extension stripped, the same way this already strips a
+ * note's own extension for matching — reusing this keeps both sides of that
+ * symmetry defined in one place.
  */
-function withoutExtension(path: string): string {
+export function withoutExtension(path: string): string {
   const dir = dirName(path);
   const stem = stemOf(path);
   return dir ? `${dir}/${stem}` : stem;
@@ -40,14 +45,31 @@ export function resolveWikiLink(target: string, allNotePaths: readonly string[])
   const trimmed = target.trim();
   if (trimmed === '') return { state: 'malformed' };
 
-  const targetSegments = trimmed.split('/');
+  // `[[Note.md]]` and `[[Note]]` are documented as equivalent in Obsidian —
+  // this resolver's own cited precedent — so an extension-free target stays
+  // fully extension-agnostic (the existing rule that lets `[[component-spec]]`
+  // resolve to a `.mdx` file). But a target that *does* carry an extension is
+  // a claim about which file this is, not just a name to search for: an
+  // extension is stripped for the segment comparison below either way, but a
+  // mismatched one (`[[new-year-goals.msf]]` against the real
+  // `new-year-goals.md`) still has to come back broken, not silently
+  // resolve — otherwise a typo'd extension would resolve to a plausible
+  // guess instead of surfacing the mistake, which is the same silent-fix
+  // this resolver already refuses to do for a mistyped stem.
+  const normalized = withoutExtension(trimmed);
+  const typedExt = trimmed.slice(normalized.length).toLowerCase();
+
+  const targetSegments = normalized.split('/');
   if (targetSegments.some((segment) => segment === '')) return { state: 'malformed' };
 
   const targetLower = targetSegments.map((s) => s.toLowerCase());
   const candidates: string[] = [];
 
   for (const notePath of allNotePaths) {
-    const noteSegments = withoutExtension(notePath).split('/');
+    const noteWithoutExt = withoutExtension(notePath);
+    if (typedExt && notePath.slice(noteWithoutExt.length).toLowerCase() !== typedExt) continue;
+
+    const noteSegments = noteWithoutExt.split('/');
     if (noteSegments.length < targetLower.length) continue;
 
     const trailing = noteSegments.slice(noteSegments.length - targetLower.length);

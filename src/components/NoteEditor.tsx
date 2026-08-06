@@ -7,9 +7,9 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import AmbiguousLinkOverlay from '@/components/editor/AmbiguousLinkOverlay';
-import LinksPanel from '@/components/editor/LinksPanel';
+import LinksMenu from '@/components/editor/LinksMenu';
 import { linkDecorations, type AmbiguousLink } from '@/components/editor/linkDecorations';
-import { dirName } from '@/lib/paths';
+import { dirName, NEW_FILE_HASH } from '@/lib/paths';
 import { parseLinks } from '@/lib/links/parse';
 import { resolveLink } from '@/lib/links/resolve';
 
@@ -94,6 +94,12 @@ export default function NoteEditor({
   const onDisk = useRef(note.content);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commitCheck = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Whether this note started life as a not-yet-on-disk stub (see the
+  // `?new=1` path in `page.tsx`) — the sidebar only has a client-side
+  // placeholder for it until the tree is refetched, so the first real write
+  // needs to trigger that refetch itself rather than waiting for the user
+  // to navigate somewhere and back.
+  const wasNew = useRef(note.hash === NEW_FILE_HASH);
 
   const save = useCallback(async (flush = false) => {
     const pending = latest.current;
@@ -125,6 +131,14 @@ export default function NoteEditor({
       setProblem(data.commitError ?? null);
       setCommit(data.commit ?? null);
 
+      if (wasNew.current) {
+        wasNew.current = false;
+        // The file is real now — hand the sidebar its authoritative row so
+        // it can drop the client-only placeholder, rather than leaving that
+        // placeholder up until some unrelated navigation happens to refetch.
+        router.refresh();
+      }
+
       // Someone may have typed while the request was in flight.
       if (latest.current !== pending) {
         setStatus('editing');
@@ -150,7 +164,7 @@ export default function NoteEditor({
       setStatus('error');
       setProblem('Could not reach the server.');
     }
-  }, [note.path]);
+  }, [note.path, router]);
 
   const onChange = (value: string) => {
     setContent(value);
@@ -230,6 +244,17 @@ export default function NoteEditor({
   useEffect(() => {
     const path = note.path;
     const flushOut = () => {
+      // Nothing new to flush since the last successful write — most
+      // consequential for a brand-new note (`note.hash` is the sentinel
+      // `NEW_FILE_HASH`), where flushing here would create and commit an
+      // empty file before the user typed a single character. React's Strict
+      // Mode deliberately mounts, unmounts, and remounts every component in
+      // dev specifically to catch a missing guard like this — it did, on the
+      // very first real use of Create. Harmless-but-redundant for an
+      // existing, untouched note too, so the guard is unconditional rather
+      // than sentinel-specific.
+      if (latest.current === onDisk.current) return;
+
       void fetch('/api/note', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -263,14 +288,14 @@ export default function NoteEditor({
           <Breadcrumb path={note.path} />
           <h1 className="mt-1.5 truncate text-2xl font-semibold text-neutral-100">{note.title}</h1>
         </div>
-        <SaveStatus status={status} commit={commit} problem={problem} onRetry={saveNow} />
+        <div className="flex shrink-0 items-center gap-3">
+          <LinksMenu links={links} notes={notes} />
+          <SaveStatus status={status} commit={commit} problem={problem} onRetry={saveNow} />
+        </div>
       </header>
 
       <div className="mx-10 border-t border-line" />
 
-      {/* Editor text and the Links panel scroll together as one region, so
-          the panel sits right after the note's actual content instead of
-          being pinned to the bottom of the viewport on a short note. */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <CodeMirror
           value={content}
@@ -289,8 +314,6 @@ export default function NoteEditor({
           className="text-sm leading-relaxed text-neutral-200"
           style={{ fontFamily: 'var(--font-mono)' }}
         />
-
-        <LinksPanel links={links} notes={notes} />
       </div>
 
       {ambiguous && (

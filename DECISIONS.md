@@ -3,9 +3,10 @@
 Updated at the end of each build phase. Everything below is decided, built, and
 verified — not planned. Sections appear as the work that justifies them lands.
 
-**Current state: the tree, opening a note, editing and saving to disk all work.
-Saves do not become commits yet — when a save becomes a commit is the next
-decision, and the one the brief weights most heavily.**
+**Current state: the tree, opening a note, editing and saving to disk all work,
+with concurrent-edit detection and crash recovery. Create and Rename
+(including link-aware rename/move) are built. Delete and undo are the
+remaining rules.**
 
 ---
 
@@ -163,6 +164,149 @@ last few keystrokes cannot be lost by clicking away.
 
 The user is never asked to press Save, but is always told where their work
 stands: the header shows whether the app is idle, writing, or done.
+
+## When a save becomes a commit
+
+The commit unit is an **editing session** — one note, one continuous stretch
+of work, one commit. Not one commit per autosave; committing on every
+keystroke would make `git log` useless, and the brief weights this decision
+above everything else.
+
+Two things happen on a timer, and they are not the same thing. **Flush**
+means commit now instead of waiting out the idle timer — it fires on 15
+seconds idle, on `Ctrl`/`Cmd`-S, on navigating to another note, and on tab
+close. **Seal** means end the session so the *next* edit starts a new commit
+— and only three things do that: the 10-minute settle window elapsing,
+something else landing a commit in between (detected by checking `HEAD` is
+still this session's own commit sha), or the app restarting. Navigating away
+and Ctrl-S both flush without sealing, on purpose: popping over to check
+another note mid-paragraph is one episode of work, not a new one, and a user
+who hits Ctrl-S out of habit every twenty seconds should not shred their own
+log.
+
+While a session stays open, further typing **amends** its commit rather than
+stacking a new one, so five minutes of editing is one line in `git log`
+instead of twenty. The commit message verb (`Create`, `Retitle`, `Edit`) is
+recomputed from the diff against the session's base on every amend, never
+accumulated — which is what makes a session that ends up creating a note read
+`Create` no matter how many times it was amended along the way, and what
+makes a session that writes 200 words then deletes 160 of them end at
+`Edit (+40 words)`, the true shape of what happened.
+
+Word counts, not line counts (`git diff --word-diff=porcelain`, tokens
+counted per hunk). `--numstat` counts lines, and a markdown paragraph is
+usually one long soft-wrapped line — rewriting a whole paragraph would read
+as `+1 -1`, and three new paragraphs would read as `+3`. That is not
+imprecise, it is misleading about how much work happened.
+
+A session that types, commits, and then is undone back to its exact starting
+content within the settle window does not leave a phantom commit behind:
+`git reset --soft HEAD~1` drops it, because `git commit --amend` refuses a
+no-op tree and stacking a new commit instead would lie about there being a
+second change.
+
+Every commit goes through an explicit pathspec (`git commit -- <path>`),
+never `git commit -a` — that is what lets several notes sit dirty on disk at
+once while only the one that just settled commits.
+
+The 10-minute settle window is arbitrary, and worth being honest about that
+rather than dressing it up: its job is not to make the log more meaningful,
+it is to make commits eventually stop being amended, so a commit someone
+looked at an hour ago is not silently still being rewritten underneath them.
+
+## Crash recovery
+
+The session map above lives in memory. If the process dies, it dies with it
+— and on restart there is no way to recover which dirty files belonged to
+which editing session, because that grouping was never written down anywhere
+except that map. This is not a gap to close later; it is a genuine limit of
+the design, so recovery does not pretend otherwise.
+
+A marker file inside `.git/` (untracked, invisible to `git status`, never
+appearing in the log) is written on startup and removed on clean shutdown.
+Its presence at the next boot is what tells the app "the working tree is
+dirty *because we crashed holding it*" apart from "the working tree was
+already dirty before we ever started" — a distinction that matters concretely
+here, since `notes/drafts/quick-thought.md` sat hand-edited and uncommitted
+in this repo at one point, and committing a reviewer's own edit under a
+message claiming the app recovered it would be a lie inside the artifact
+being graded.
+
+On a genuine crash, everything found dirty is swept into **one** commit,
+explicitly labelled as a recovery with no claimed grouping
+(`Recover N notes with unsaved edits`, body noting intent grouping is
+unavailable) — not fragmented into per-note commits that invent an intent
+nobody observed.
+
+Known rough edge: `next dev`'s own restarts can trip the same marker check
+and produce a false "unclean shutdown" during ordinary development, not just
+on a real crash.
+
+## Link parsing and resolution
+
+Every note is scanned for `[[wiki links]]`, markdown links, and relative
+image paths, and each is resolved against the real file list rather than
+just pattern-matched.
+
+Wiki links resolve by comparing the **trailing path segments**, exact and
+case-insensitive, against every note's path with its extension stripped —
+not a substring or fuzzy match. That is what lets `[[design/notes]]`
+disambiguate between the two files in this repo named `notes.md`, and what
+keeps a target that merely happens to be a substring of some renamed file's
+new name correctly reported as broken instead of guessed at.
+
+Markdown and image links resolve as ordinary relative paths from the
+*source* note's own directory, checked against the whole repo's file list —
+not just notes — since a relative image link legitimately resolves outside
+`notes/` and into `assets/`.
+
+Two links are broken in the source data independent of anything the app
+does: the image link in `auth-redesign-kickoff.md` is one `../` short of
+reaching the repo root, and one wiki-link target is missing the date prefix
+its real filename carries. **Decision: detect and surface both, do not
+silently rewrite content the user never touched.** Fixing content nobody
+asked to change is a worse failure than leaving a link visibly broken.
+
+This layer is built and correct against all ten links in the dataset, but
+nothing consumes it yet beyond the read-only backlinks panel — there is no
+rename or move operation in the app for it to protect. It exists now because
+retrofitting link-awareness into a rename implemented without it later would
+mean redoing the rename, not just adding a check on top.
+
+## The sidebar and link lists show filenames, not titles — reversed from the first pass
+
+The first build used the computed title (see "The title rule was
+reverse-engineered, not invented" above) as the primary label in the sidebar
+and in the wiki-link list, on the theory that a title reads better than a
+filename and the path is one hover away. Checking that against how real
+wiki-link tools behave is what caught it as wrong.
+
+Obsidian shows the filename you typed inside `[[ ]]`, full stop — displaying
+a frontmatter title instead exists only as a third-party plugin, never the
+default. Logseq's own attempt at a title override is confusing enough that it
+has an open bug report for renaming the file instead of just relabelling it.
+TiddlyWiki treats a friendlier display field as an explicit opt-in on top of
+the title, never a silent replacement. The pattern holds across all three:
+the identifier you'd actually type or click is what's shown by default, and a
+nicer display name is something the author opts into — never something the
+app decides on its own.
+
+That matters specifically here because the app resolves real `[[wiki links]]`
+against real files and does not support `[[target|alias]]` syntax. When
+someone writes `[[frontend-setup]]` and the app showed "Frontend Setup Guide"
+instead, nothing about that substitution was authored by anyone — the app was
+silently relabelling a name the user typed, with no way to opt out.
+
+Fixed: `NoteTree.tsx` now shows the exact on-disk filename (`LEGACY-IMPORT.MD`,
+`🎉 first-day.md`, all four `todo.md`s told apart by folder, same as any
+filesystem browser); `LinksMenu.tsx` and `AmbiguousLinkOverlay.tsx` show
+resolved paths instead of titles, which was the more broken case — a title
+cannot disambiguate four files that all match the same `[[todo]]` stem, but a
+path always can. The title rule itself did not go away: it is still what
+`.noteindex.json` stores, still what a note's own heading shows once it is
+open (a document naming itself is a different claim than the app relabelling
+it while browsing), and still available as a hover tooltip everywhere else.
+What changed is which one is the headline.
 
 ---
 

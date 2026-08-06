@@ -1,10 +1,13 @@
+import AppShell from '@/components/AppShell';
 import NoteEditor from '@/components/NoteEditor';
-import NoteTree from '@/components/NoteTree';
+import { NEW_FILE_HASH } from '@/lib/paths';
 import { checkRepo } from '@/lib/server/config';
 import { listNotes } from '@/lib/server/index-file';
-import { readNote } from '@/lib/server/notes';
+import { readNote, resolveNotePath } from '@/lib/server/notes';
+import { PathError } from '@/lib/server/paths';
 import { listOutsideNotes } from '@/lib/server/walk';
 import { buildTree } from '@/lib/tree';
+import { titleFor } from '@/lib/titles';
 
 /**
  * The whole app is one page: the tree on the left, the open note on the right,
@@ -19,7 +22,7 @@ export default async function Home(props: PageProps<'/'>) {
   const repo = checkRepo();
   if (!repo.ok) return <SetupProblem root={repo.root} problem={repo.problem} />;
 
-  const { path } = await props.searchParams;
+  const { path, new: isNew } = await props.searchParams;
   const selected = typeof path === 'string' ? path : undefined;
 
   const [notes, otherFiles] = await Promise.all([listNotes(), listOutsideNotes()]);
@@ -30,32 +33,37 @@ export default async function Home(props: PageProps<'/'>) {
   let openError: string | null = null;
   if (selected) {
     try {
-      note = await readNote(selected);
+      if (isNew === '1') {
+        // A brand-new note: confirming its name never touched disk (see
+        // structural.ts's crud-operations-spec.md-driven design), so there's
+        // nothing to read yet. `resolveNotePath` still runs, unused beyond
+        // its validation, so a path that escapes `notes/` fails the same way
+        // an ordinary open would rather than silently stubbing anything.
+        resolveNotePath(selected);
+        note = { path: selected, title: titleFor(selected, ''), content: '', hash: NEW_FILE_HASH, eol: '\n' as const };
+      } else {
+        note = await readNote(selected);
+      }
     } catch (error) {
-      openError = error instanceof Error ? error.message : 'Could not open that note.';
+      openError =
+        error instanceof PathError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : 'Could not open that note.';
     }
   }
 
   return (
-    <div className="flex min-h-0 flex-1">
-      <nav className="flex w-72 shrink-0 flex-col overflow-y-auto border-r border-line bg-surface">
-        <div className="sticky top-0 z-10 border-b border-line bg-surface px-3.5 py-3">
-          <p className="text-sm font-semibold text-neutral-200">Notes</p>
-          <p className="text-xs text-neutral-500">{notes.length} notes</p>
-        </div>
-        <NoteTree nodes={tree} selected={selected} />
-      </nav>
-
-      <main className="flex min-w-0 flex-1 flex-col">
-        {note ? (
-          // Keyed by path so switching notes gives a fresh editor rather than
-          // one holding the previous note's unsaved text.
-          <NoteEditor key={note.path} note={note} notes={notes} repoFiles={repoFiles} />
-        ) : (
-          <Empty message={openError} />
-        )}
-      </main>
-    </div>
+    <AppShell tree={tree} noteCount={notes.length} selected={selected}>
+      {note ? (
+        // Keyed by path so switching notes gives a fresh editor rather than
+        // one holding the previous note's unsaved text.
+        <NoteEditor key={note.path} note={note} notes={notes} repoFiles={repoFiles} />
+      ) : (
+        <Empty message={openError} />
+      )}
+    </AppShell>
   );
 }
 

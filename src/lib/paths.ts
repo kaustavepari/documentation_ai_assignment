@@ -76,3 +76,47 @@ export function resolveRelativePath(fromDir: string, target: string): string {
 
   return resolved.join('/');
 }
+
+/**
+ * Inverse of `resolveRelativePath`: the relative path from a directory to a
+ * repo-relative target, one `..` per directory segment not shared with the
+ * target. Needed when a rename/move changes a note's own directory (its
+ * outbound relative links need new `../` counts) or changes where a linking
+ * note has to reach it from.
+ *
+ * Verified against the one real case in the dataset: from
+ * `notes/work/meetings` to `assets/diagrams/auth-flow.svg` produces
+ * `../../../assets/diagrams/auth-flow.svg` — the correct 3-level path
+ * `repo-analysis.md` confirmed the source data gets wrong by one `../`.
+ */
+export function relativePath(fromDir: string, toPath: string): string {
+  const fromSegments = fromDir ? fromDir.split('/') : [];
+  const toSegments = toPath.split('/');
+
+  let common = 0;
+  while (
+    common < fromSegments.length &&
+    common < toSegments.length &&
+    fromSegments[common] === toSegments[common]
+  ) {
+    common++;
+  }
+
+  const ups = Array(fromSegments.length - common).fill('..');
+  return [...ups, ...toSegments.slice(common)].join('/');
+}
+
+/** `oldPath` and `newPath` differ only in case — the Windows/macOS trap where
+ *  a naive single `git mv` can silently no-op on a case-insensitive
+ *  filesystem. See DECISIONS.md's case-only-rename section. */
+export function isCaseOnlyRename(oldPath: string, newPath: string): boolean {
+  return oldPath !== newPath && oldPath.toLowerCase() === newPath.toLowerCase();
+}
+
+/**
+ * Sentinel `baseHash` meaning "this file shouldn't exist on disk yet" — a
+ * real SHA-256 hex digest is never the empty string, so this can never
+ * collide with a genuine hash. The create flow opens an editor session with
+ * this as the starting hash; the first autosave is the first disk write.
+ */
+export const NEW_FILE_HASH = '';

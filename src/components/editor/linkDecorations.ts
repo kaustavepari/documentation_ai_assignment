@@ -43,11 +43,25 @@ function classFor(link: ResolvedLink): string | null {
   return null;
 }
 
+/**
+ * Same wording VS Code itself uses for a followable link ("⌘-click to follow
+ * link" / "Ctrl-click to follow link") — the modifier this app's click
+ * handler actually requires, so the hover text should say so rather than
+ * leaving a resolved link with no affordance until someone tries clicking it.
+ */
+function navigateHint(): string {
+  const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+  return mac ? '⌘-click to open' : 'Ctrl-click to open';
+}
+
 function hoverText(link: ResolvedLink): string {
   if (link.state === 'broken') {
     return link.type === 'wiki' ? `No note matches "${link.target}"` : `Nothing at "${link.target}"`;
   }
   if (link.state === 'ambiguous') return `${link.candidates.length} notes match — click to choose`;
+  if (link.state === 'resolved' && link.resolvedKind === 'note') {
+    return `${navigateHint()} — ${link.resolvedPath}`;
+  }
   return '';
 }
 

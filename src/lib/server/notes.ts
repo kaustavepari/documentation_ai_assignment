@@ -2,7 +2,9 @@ import 'server-only';
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 
+import { NEW_FILE_HASH } from '../paths';
 import { titleFor } from '../titles';
 import { PathError, resolveInRepo } from './paths';
 
@@ -33,8 +35,12 @@ export function hashOf(bytes: Buffer): string {
  * Notes live under `notes/`. `resolveInRepo` already refuses anything outside
  * the repo; this narrows it further so the note endpoints cannot be aimed at
  * `README.md` or `.noteindex.json`, which the app manages by other means.
+ *
+ * Exported (not just used internally) because the structural operations —
+ * create, rename, move, delete — all need this same `notes/`-confined
+ * validation on paths that don't necessarily exist on disk yet.
  */
-function resolveNote(relPath: string): string {
+export function resolveNotePath(relPath: string): string {
   const clean = relPath.replace(/\\/g, '/');
   if (clean !== 'notes' && !clean.startsWith('notes/')) {
     throw new PathError(`Not a note: ${relPath}`);
@@ -61,7 +67,7 @@ export function toEol(content: string, eol: Eol): string {
 }
 
 export async function readNote(relPath: string): Promise<Note> {
-  const bytes = await fs.readFile(resolveNote(relPath));
+  const bytes = await fs.readFile(resolveNotePath(relPath));
   const raw = bytes.toString('utf8');
   const eol = detectEol(raw);
   const content = raw.replace(/\r\n/g, '\n');
@@ -91,8 +97,22 @@ export async function writeNote(
   content: string,
   baseHash: string,
 ): Promise<SaveResult> {
-  const abs = resolveNote(relPath);
-  const current = await fs.readFile(abs);
+  const abs = resolveNotePath(relPath);
+
+  let current: Buffer;
+  try {
+    current = await fs.readFile(abs);
+  } catch (error) {
+    // A missing file is only expected when the caller is creating one, which
+    // it signals with the sentinel hash. Any other missing-file case (a
+    // stale edit whose note vanished) is not this function's problem to
+    // interpret — let it propagate, same as before this branch existed.
+    if (isEnoent(error) && baseHash === NEW_FILE_HASH) {
+      return createNote(abs, relPath, content);
+    }
+    throw error;
+  }
+
   const currentHash = hashOf(current);
 
   if (currentHash !== baseHash) {
@@ -108,4 +128,49 @@ export async function writeNote(
   await fs.writeFile(abs, bytes);
 
   return { ok: true, hash: hashOf(bytes), title: titleFor(relPath, content) };
+}
+
+/**
+ * The create path: the caller believes nothing exists at `abs` yet.
+ * Directories are made as needed — a brand-new folder is client-side-only
+ * state until this very write (see crud-operations-spec.md), so nothing on
+ * disk may exist above the file either.
+ *
+ * `wx` makes "must not already exist" an OS-enforced atomic check rather
+ * than a check-then-write race: if two requests try to create the same new
+ * note at once, the loser gets back the same conflict shape a stale edit
+ * would, instead of silently clobbering the winner.
+ */
+async function createNote(abs: string, relPath: string, content: string): Promise<SaveResult> {
+  const bytes = Buffer.from(content, 'utf8'); // no prior file to inherit an EOL convention from
+
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+
+  try {
+    const handle = await fs.open(abs, 'wx');
+    try {
+      await handle.writeFile(bytes);
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (!isEexist(error)) throw error;
+    const current = await fs.readFile(abs);
+    return {
+      ok: false,
+      reason: 'conflict',
+      currentHash: hashOf(current),
+      currentContent: current.toString('utf8').replace(/\r\n/g, '\n'),
+    };
+  }
+
+  return { ok: true, hash: hashOf(bytes), title: titleFor(relPath, content) };
+}
+
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
+function isEexist(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'EEXIST';
 }

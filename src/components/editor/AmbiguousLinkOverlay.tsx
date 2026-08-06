@@ -64,9 +64,10 @@ export default function AmbiguousLinkOverlay({
               href={`/?path=${encodeURIComponent(candidate.path)}`}
               onClick={onDismiss}
               role="option"
-              className="block truncate px-3 py-1.5 text-sm text-neutral-200 hover:bg-white/5"
+              title={candidate.title}
+              className="block truncate px-3 py-1.5 font-mono text-sm text-neutral-200 hover:bg-white/5"
             >
-              {candidate.title}
+              {candidate.path}
             </Link>
           </li>
         ))}

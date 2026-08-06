@@ -5,6 +5,7 @@ import { useState } from 'react';
 
 import { PlusFileIcon, PlusFolderIcon } from '@/components/icons';
 import LinkImpactModal from '@/components/LinkImpactModal';
+import MoveToDialog from '@/components/MoveToDialog';
 import NoteTree, { type PendingCreate } from '@/components/NoteTree';
 import RowContextMenu from '@/components/RowContextMenu';
 import type { FixableLink, UnfixableLink } from '@/lib/links/rewrite';
@@ -68,6 +69,9 @@ export default function AppShell({
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   // The row a right-click or "more" button opened a menu for.
   const [contextMenu, setContextMenu] = useState<{ path: string; x: number; y: number } | null>(null);
+  // The note showing the "Move to…" folder picker — the keyboard-accessible
+  // path to the same move that drag-and-drop performs directly.
+  const [movingPath, setMovingPath] = useState<string | null>(null);
   // Set once a confirmed rename turns out to affect other notes' links —
   // null means either nothing is pending or the impact scan found nothing
   // worth asking about, in which case the rename already went straight through.
@@ -89,6 +93,17 @@ export default function AppShell({
   if (livePendingFile) {
     displayTree = withClientFile(displayTree, dirName(livePendingFile), baseName(livePendingFile));
   }
+
+  // Every folder a note could move to, for the "Move to…" dialog: real ones
+  // plus still-ephemeral ones (see `withClientFolder`), always including the
+  // root, minus wherever the note already is — moving it there would be a
+  // no-op the picker shouldn't even offer.
+  const moveTargetFolders = (path: string): string[] => {
+    const currentFolder = dirName(path);
+    const all = new Set(['notes', ...realFolders, ...liveClientFolders]);
+    all.delete(currentFolder);
+    return [...all].sort();
+  };
 
   const startCreate = (kind: 'file' | 'folder') => setPendingCreate({ parentPath: selectedFolder, kind });
 
@@ -126,11 +141,11 @@ export default function AppShell({
   };
 
   // The one entry point for "change this note's path," shared by inline
-  // rename and (later) drag-and-drop and the Move-to dialog — each just
-  // computes a different `newPath` and calls this. Checks link impact first;
-  // nothing unfixable means nothing here needs a human call (a fixable link
-  // is safe by construction, see rewrite.ts), so it proceeds straight
-  // through, rewriting whatever's fixable — which may be nothing at all.
+  // rename, drag-and-drop, and the Move-to dialog — each just computes a
+  // different `newPath` and calls this. Checks link impact first; nothing
+  // unfixable means nothing here needs a human call (a fixable link is safe
+  // by construction, see rewrite.ts), so it proceeds straight through,
+  // rewriting whatever's fixable — which may be nothing at all.
   const attemptMove = async (oldPath: string, newPath: string) => {
     if (newPath === oldPath) return;
     try {
@@ -153,6 +168,29 @@ export default function AppShell({
     if (!oldPath) return;
     setRenamingPath(null);
     attemptMove(oldPath, `${dirName(oldPath)}/${name}`);
+  };
+
+  const startMove = (path: string) => {
+    setRenameError(null);
+    setMovingPath(path);
+    setContextMenu(null);
+  };
+
+  const confirmMove = (destFolder: string) => {
+    const oldPath = movingPath;
+    if (!oldPath) return;
+    setMovingPath(null);
+    attemptMove(oldPath, `${destFolder}/${baseName(oldPath)}`);
+  };
+
+  // Dropping something currently mid-inline-rename would race the two
+  // interactions against the same path — ignored rather than guarded against
+  // more elaborately, since it's an edge case a user is unlikely to hit
+  // outside of deliberately trying to.
+  const handleDrop = (draggedPath: string, targetFolder: string) => {
+    if (draggedPath === renamingPath) return;
+    setRenameError(null);
+    attemptMove(draggedPath, `${targetFolder}/${baseName(draggedPath)}`);
   };
 
   const resolveLinkImpact = async (rewriteLinks: boolean) => {
@@ -222,6 +260,7 @@ export default function AppShell({
           onRenameConfirm={confirmRename}
           onRenameCancel={() => setRenamingPath(null)}
           onRowContextMenu={(path, x, y) => setContextMenu({ path, x, y })}
+          onDropOnFolder={handleDrop}
         />
       </nav>
 
@@ -232,7 +271,17 @@ export default function AppShell({
           x={contextMenu.x}
           y={contextMenu.y}
           onRename={() => startRename(contextMenu.path)}
+          onMoveTo={() => startMove(contextMenu.path)}
           onDismiss={() => setContextMenu(null)}
+        />
+      )}
+
+      {movingPath && (
+        <MoveToDialog
+          path={movingPath}
+          folders={moveTargetFolders(movingPath)}
+          onConfirm={confirmMove}
+          onCancel={() => setMovingPath(null)}
         />
       )}
 

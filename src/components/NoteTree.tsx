@@ -9,6 +9,8 @@ import { ancestorsOf, type TreeNode } from '@/lib/tree';
 
 export type PendingCreate = { parentPath: string; kind: 'file' | 'folder' } | null;
 
+const DRAG_MIME = 'application/x-note-path';
+
 /**
  * The note tree.
  *
@@ -39,6 +41,7 @@ export default function NoteTree({
   onRenameConfirm,
   onRenameCancel,
   onRowContextMenu,
+  onDropOnFolder,
 }: {
   nodes: TreeNode[];
   selected?: string;
@@ -52,11 +55,17 @@ export default function NoteTree({
   onRenameConfirm: (name: string) => void;
   onRenameCancel: () => void;
   onRowContextMenu: (path: string, x: number, y: number) => void;
+  onDropOnFolder: (draggedPath: string, targetFolder: string) => void;
 }) {
   // Everything starts open: the whole tree fits, and the hidden `.scratch`
   // folder should be visible on arrival rather than something to go hunting for.
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const [revealed, setRevealed] = useState(selected);
+  // Which row (or the root itself) is the current drag hovering over, and
+  // which row is being dragged — both purely presentational, so they live
+  // here rather than in `AppShell`.
+  const [dragOverPath, setDragOverPath] = useState<string | null>(null);
+  const [draggingPath, setDraggingPath] = useState<string | null>(null);
 
   // Opening a deep note reveals it, even if its folder was collapsed.
   //
@@ -88,6 +97,14 @@ export default function NoteTree({
       return next;
     });
 
+  const drop = (event: React.DragEvent, targetFolder: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragOverPath(null);
+    const draggedPath = event.dataTransfer.getData(DRAG_MIME);
+    if (draggedPath) onDropOnFolder(draggedPath, targetFolder);
+  };
+
   const rowProps = {
     selected,
     selectedFolder,
@@ -102,10 +119,23 @@ export default function NoteTree({
     onRenameConfirm,
     onRenameCancel,
     onRowContextMenu,
+    dragOverPath,
+    setDragOverPath,
+    draggingPath,
+    setDraggingPath,
+    drop,
   };
 
   return (
-    <ul className="py-1.5">
+    <ul
+      className={`min-h-full py-1.5 ${dragOverPath === 'notes' ? 'bg-accent-subtle' : ''}`}
+      onDragOver={(event) => {
+        event.preventDefault();
+        setDragOverPath('notes');
+      }}
+      onDragLeave={() => setDragOverPath((prev) => (prev === 'notes' ? null : prev))}
+      onDrop={(event) => drop(event, 'notes')}
+    >
       {pendingCreate?.parentPath === 'notes' && (
         <CreateRow
           kind={pendingCreate.kind}
@@ -137,6 +167,11 @@ type RowProps = {
   onRenameConfirm: (name: string) => void;
   onRenameCancel: () => void;
   onRowContextMenu: (path: string, x: number, y: number) => void;
+  dragOverPath: string | null;
+  setDragOverPath: React.Dispatch<React.SetStateAction<string | null>>;
+  draggingPath: string | null;
+  setDraggingPath: React.Dispatch<React.SetStateAction<string | null>>;
+  drop: (event: React.DragEvent, targetFolder: string) => void;
 };
 
 function Row({ node, siblingNames, ...rest }: RowProps) {
@@ -154,6 +189,11 @@ function Row({ node, siblingNames, ...rest }: RowProps) {
     onRenameConfirm,
     onRenameCancel,
     onRowContextMenu,
+    dragOverPath,
+    setDragOverPath,
+    draggingPath,
+    setDraggingPath,
+    drop,
   } = rest;
 
   if (node.kind === 'file') {
@@ -178,12 +218,20 @@ function Row({ node, siblingNames, ...rest }: RowProps) {
         onSelectFolder={onSelectFolder}
         onStartRename={onStartRename}
         onContextMenu={onRowContextMenu}
+        isDragOver={dragOverPath === node.path}
+        isDragging={draggingPath === node.path}
+        onDragOverRow={() => setDragOverPath(node.path)}
+        onDragLeaveRow={() => setDragOverPath((prev: string | null) => (prev === node.path ? null : prev))}
+        onDropRow={(event) => drop(event, dirName(node.path))}
+        onDragStartRow={() => setDraggingPath(node.path)}
+        onDragEndRow={() => setDraggingPath(null)}
       />
     );
   }
 
   const isOpen = !collapsed.has(node.path);
   const isTarget = node.path === selectedFolder;
+  const isDragOver = dragOverPath === node.path;
 
   return (
     <li>
@@ -193,11 +241,23 @@ function Row({ node, siblingNames, ...rest }: RowProps) {
           onToggle(node.path);
           onSelectFolder(node.path);
         }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setDragOverPath(node.path);
+        }}
+        onDragLeave={(event) => {
+          event.stopPropagation();
+          setDragOverPath((prev: string | null) => (prev === node.path ? null : prev));
+        }}
+        onDrop={(event) => drop(event, node.path)}
         aria-expanded={isOpen}
         title={node.path}
         className={`group flex w-full items-center gap-1.5 rounded-r py-[5px] pr-2 pl-1.5 text-left transition-colors hover:bg-white/5 ${
           isTarget ? 'bg-white/5' : ''
-        } ${node.hidden ? 'text-neutral-500' : 'text-neutral-300'}`}
+        } ${isDragOver ? 'bg-accent-subtle ring-1 ring-inset ring-accent' : ''} ${
+          node.hidden ? 'text-neutral-500' : 'text-neutral-300'
+        }`}
       >
         <ChevronIcon
           className={`size-3.5 shrink-0 text-neutral-600 transition-transform duration-150 ${
@@ -247,17 +307,52 @@ function NoteRow({
   onSelectFolder,
   onStartRename,
   onContextMenu,
+  isDragOver,
+  isDragging,
+  onDragOverRow,
+  onDragLeaveRow,
+  onDropRow,
+  onDragStartRow,
+  onDragEndRow,
 }: {
   node: Extract<TreeNode, { kind: 'file' }>;
   selected?: string;
   onSelectFolder: (path: string) => void;
   onStartRename: (path: string) => void;
   onContextMenu: (path: string, x: number, y: number) => void;
+  isDragOver: boolean;
+  isDragging: boolean;
+  onDragOverRow: () => void;
+  onDragLeaveRow: () => void;
+  onDropRow: (event: React.DragEvent) => void;
+  onDragStartRow: () => void;
+  onDragEndRow: () => void;
 }) {
   const isSelected = node.path === selected;
 
   return (
-    <li className="group/row relative">
+    <li
+      className={`group/row relative ${isDragOver ? 'bg-accent-subtle ring-1 ring-inset ring-accent' : ''}`}
+      draggable
+      onDragStart={(event) => {
+        event.dataTransfer.setData(DRAG_MIME, node.path);
+        event.dataTransfer.setData('text/plain', node.path);
+        event.dataTransfer.effectAllowed = 'move';
+        onDragStartRow();
+      }}
+      onDragEnd={onDragEndRow}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = 'move';
+        onDragOverRow();
+      }}
+      onDragLeave={(event) => {
+        event.stopPropagation();
+        onDragLeaveRow();
+      }}
+      onDrop={onDropRow}
+    >
       <Link
         href={`/?path=${encodeURIComponent(node.path)}`}
         onClick={() => onSelectFolder(dirName(node.path))}
@@ -277,6 +372,8 @@ function NoteRow({
         title={`${node.title}\n${node.path}`}
         aria-current={isSelected ? 'page' : undefined}
         className={`flex items-center gap-1.5 rounded-r border-l-2 py-[5px] pr-7 pl-[13px] transition-colors ${
+          isDragging ? 'opacity-40' : ''
+        } ${
           isSelected
             ? 'border-accent bg-accent-subtle text-accent'
             : 'border-transparent text-neutral-400 hover:bg-white/5 hover:text-neutral-200'

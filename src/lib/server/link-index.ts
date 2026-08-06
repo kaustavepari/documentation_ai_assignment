@@ -35,11 +35,22 @@ export type BacklinkSummary = { path: string; count: number; backlinks: Backlink
  * `null` means `targetPath` isn't a known note — distinct from a real note
  * with zero backlinks, so the API route can tell "nothing links here" apart
  * from "no such note" and return the right status for each.
+ *
+ * Deduplicated by source note: `backlinksFor` returns one entry per raw link
+ * *occurrence*, which is what rename's splicing needs (a file can link to
+ * the same note twice and both need rewriting), but callers of this summary
+ * — the delete confirmation UI and the delete commit's message body — care
+ * about how many *notes* are affected, not how many links. Without this, a
+ * file linking to the target twice would be counted and listed twice.
  */
 export async function getBacklinkSummary(targetPath: string): Promise<BacklinkSummary | null> {
   const index = await buildRepoLinkIndex();
   if (!index.outbound.has(targetPath)) return null;
 
-  const backlinks = backlinksFor(index, targetPath);
+  const bySource = new Map<string, Backlink>();
+  for (const link of backlinksFor(index, targetPath)) {
+    if (!bySource.has(link.sourcePath)) bySource.set(link.sourcePath, link);
+  }
+  const backlinks = [...bySource.values()];
   return { path: targetPath, count: backlinks.length, backlinks };
 }

@@ -273,6 +273,24 @@ export type RestoreResult = { sha: string; short: string; path: string; title: s
 
 export async function restoreNote({ sha }: { sha: string }): Promise<RestoreResult> {
   return withQuiescedTransaction(async () => {
+    // Checked up front rather than left to `git revert`'s own conflict
+    // detection: reverting a pure file-delete commit onto a path something
+    // else has since recreated does not reliably surface as a merge
+    // conflict — confirmed the hard way, it can apply cleanly and silently
+    // overwrite the new file's content with the deleted one, no error at
+    // all. The deleted path itself comes from `diff-tree`, the same
+    // truncation-proof technique `trash.ts` uses, not from the (possibly
+    // truncated) commit subject.
+    const deletedRaw = await git().raw([
+      'diff-tree', '--no-commit-id', '--diff-filter=D', '--name-only', '-r', sha,
+    ]);
+    const deletedPath = deletedRaw.split('\n').map((line) => line.trim()).find(Boolean);
+    if (deletedPath && (await exists(deletedPath))) {
+      throw new RestoreConflictError(
+        `Could not restore — "${deletedPath}" already exists (something else was created there since).`,
+      );
+    }
+
     try {
       await git().raw(['revert', '--no-commit', sha]);
     } catch {

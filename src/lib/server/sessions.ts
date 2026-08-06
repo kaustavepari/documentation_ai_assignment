@@ -135,6 +135,29 @@ export async function flushSession(path: string): Promise<CommitInfo | null> {
 }
 
 /**
+ * Same work as `flushSession`, but assumes the caller already holds
+ * `repoLock` — used only by `flushAll`.
+ *
+ * `flushAll` only ever runs from inside `withQuiescedTransaction`'s own
+ * `repoLock.run` callback (`structural.ts`). `Mutex.run` is a plain FIFO
+ * chain, not reentrant: calling it again from inside a job it's already
+ * running queues the new job behind that same still-pending job, which can
+ * never resolve first because it's the one waiting on the new job. That
+ * deadlock was real, not theoretical — a structural op (rename/delete/
+ * restore) starting while any note had unflushed autosave work in its
+ * 15-second idle window would hang forever with the lock wedged for the
+ * whole app, not just that request.
+ */
+async function flushSessionLocked(path: string): Promise<CommitInfo | null> {
+  const session = sessions.get(path);
+  if (!session) return null;
+  if (session.timer) clearTimeout(session.timer);
+  session.timer = null;
+  if (!session.dirty) return null;
+  return commitSession(session);
+}
+
+/**
  * Commit every open session.
  *
  * Structural operations call this first. It gives them two things at once: a
@@ -146,7 +169,7 @@ export async function flushAll(): Promise<CommitInfo[]> {
   const open = [...sessions.keys()];
   const done: CommitInfo[] = [];
   for (const path of open) {
-    const info = await flushSession(path);
+    const info = await flushSessionLocked(path);
     if (info) done.push(info);
   }
   return done;

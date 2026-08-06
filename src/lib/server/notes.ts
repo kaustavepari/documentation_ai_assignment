@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { NEW_FILE_HASH } from '../paths';
 import { titleFor } from '../titles';
+import { repoLock } from './mutex';
 import { PathError, resolveInRepo } from './paths';
 
 /** Line endings, preserved per file. See `readNote`. */
@@ -91,8 +92,25 @@ export type SaveResult =
  * This is the durability layer only — it puts bytes on disk and does not
  * commit. Committing is a separate decision about *when*, deliberately not
  * wired into the write path.
+ *
+ * The read-check-write sequence below is not atomic on its own — two
+ * requests can both read the same on-disk state, both see their `baseHash`
+ * matches, and both write, the second one silently winning with no conflict
+ * ever raised to either caller. Confirmed empirically with two truly
+ * concurrent calls before this lock was added: one save vanished completely,
+ * and both callers were told `ok: true`. `repoLock` is the same one-at-a-time
+ * serialization every other repo-touching operation in this app already
+ * goes through; this was the one path that had never been brought under it.
  */
 export async function writeNote(
+  relPath: string,
+  content: string,
+  baseHash: string,
+): Promise<SaveResult> {
+  return repoLock.run(() => writeNoteLocked(relPath, content, baseHash));
+}
+
+async function writeNoteLocked(
   relPath: string,
   content: string,
   baseHash: string,

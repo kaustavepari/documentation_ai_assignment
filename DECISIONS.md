@@ -15,8 +15,8 @@ both backed by `git revert`) are all built. All six CRUD/undo rules are done.**
 Next.js App Router, single process, single `npm run dev`. No separate API
 server to run or keep in sync.
 
-All filesystem and git access is confined to four modules under
-`src/lib/server/`, each of which imports `server-only`. That turns "don't let
+All filesystem and git access is confined to `src/lib/server/`, every module
+in it importing `server-only`. That turns "don't let
 this reach the browser" from a convention I have to remember into a build
 error. It matters more than it sounds: a stray import of the git module into a
 client component would otherwise fail at runtime, in the browser, with a
@@ -151,8 +151,32 @@ the same.
 
 This is the detection half of Rule 2, and it is in the save path from its first
 version rather than retrofitted — a save endpoint without it has the wrong
-shape, and adding it later would mean changing every caller. What the user sees
-and can do when it fires is built on top of this.
+shape, and adding it later would mean changing every caller.
+
+**The check-then-write itself needs to be one atomic step, not two.** Read,
+compare, write is only safe if nothing else can run between the read and the
+write. Confirmed the hard way: two genuinely concurrent saves against the
+same stale hash both read the same on-disk bytes, both saw their fingerprint
+match, and both wrote — the second one winning with no conflict ever raised
+to either caller, silently. Every other place this app touches the repo
+already goes through one shared lock (`repoLock`); this save path was the
+one write site that had never been brought under it. It now is.
+
+**What the user sees on a real conflict.** The 409 hands back the current
+on-disk content, and the editor offers two explicit choices — keep mine
+(overwrite, now that the fresh state is known) or load theirs (discard my
+edits, take what's on disk). Neither is silent; both require the user to
+choose with the losing version visibly in front of them first.
+
+**What this does not do: merge.** A real three-way merge (git already has
+`git merge-file` for exactly this) would auto-resolve the common case —
+two edits to different parts of the same note — with no dialog at all, and
+only ask a human when lines genuinely overlap. Considered, not built: this
+app already satisfies Rule 2 as written ("detect and warn" is one of the
+three options it explicitly names), and a real merge is enough additional
+surface — a new save-path branch, a new editor state for showing conflict
+markers inline — that it's the first thing on the list below rather than
+something to half-build now.
 
 ## Typing saves the note by itself
 
@@ -312,6 +336,32 @@ What changed is which one is the headline.
 
 ---
 
-*Still to be decided, in the phases that produce them: when a save becomes a
-commit, what the user sees and can do when two tabs collide, how renames treat
-links, and how delete and undo behave.*
+## What's skipped, and what I'd build first with another week
+
+**A real merge for the two-tabs case.** Rule 2 is satisfied as written — the
+save is never silently overwritten, and the user resolves a conflict with
+both versions visible. But "detect and warn" is the least sophisticated of
+the three options the brief names. `git merge-file` already does a real
+three-way merge and would auto-resolve the common case (two edits to
+different parts of the same note) with no dialog at all. First thing I'd
+build.
+
+**The four bugs in `dev-notes/known-bugs.md`.** Logged rather than chased
+down mid-build, on purpose — none of them lose data or corrupt the repo,
+they're UI-level (an overlay that can render off-screen, a rename that
+silently no-ops in one specific pre-existing-ambiguity case, the trash panel
+listing a path's older delete alongside its current one). Fixable, just not
+before something that actually touches correctness.
+
+**A live "someone else has this open" hint.** The data for it already
+exists — `sessions.ts` tracks which notes have an open episode of work in
+memory, and `/api/note/status` already exposes it for a different reason.
+Surfacing it as a passive banner before a conflict happens, not just after,
+would be a small addition on top of what's already tracked.
+
+**Folder rename/move.** Explicitly out of scope from the start, not a late
+cut: a folder here is never a real thing on disk, only ever the side effect
+of where its files currently live (see "What counts as a note" and the
+tree-is-recomputed-fresh reasoning throughout `structural.ts`), so "moving a
+folder" doesn't have a single unambiguous meaning the way moving a file
+does.

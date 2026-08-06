@@ -86,6 +86,9 @@ export default function NoteEditor({
   const [commit, setCommit] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [ambiguous, setAmbiguous] = useState<{ link: AmbiguousLink; x: number; y: number } | null>(null);
+  // What the server says is actually on disk right now, captured off a 409 —
+  // the two conflict actions below are the only things that read this.
+  const [conflictWith, setConflictWith] = useState<{ hash: string; content: string } | null>(null);
 
   // Refs, not state: the debounce timer and the unmount flush need the newest
   // values without waiting for a re-render.
@@ -118,6 +121,7 @@ export default function NoteEditor({
       if (response.status === 409) {
         setStatus('conflict');
         setProblem(data.message ?? 'This note changed somewhere else.');
+        setConflictWith({ hash: data.currentHash, content: data.currentContent });
         return;
       }
       if (!response.ok) {
@@ -130,6 +134,7 @@ export default function NoteEditor({
       onDisk.current = pending;
       setProblem(data.commitError ?? null);
       setCommit(data.commit ?? null);
+      setConflictWith(null);
 
       if (wasNew.current) {
         wasNew.current = false;
@@ -183,6 +188,27 @@ export default function NoteEditor({
     if (timer.current) clearTimeout(timer.current);
     void save(true);
   }, [save]);
+
+  // The two ways out of a conflict — both explicit, neither silent. Retrying
+  // with the same stale hash would just 409 again forever, so both first
+  // adopt the hash the server just proved is current.
+  const keepMine = useCallback(() => {
+    if (!conflictWith) return;
+    hash.current = conflictWith.hash;
+    setConflictWith(null);
+    saveNow();
+  }, [conflictWith, saveNow]);
+
+  const loadTheirs = useCallback(() => {
+    if (!conflictWith) return;
+    hash.current = conflictWith.hash;
+    onDisk.current = conflictWith.content;
+    latest.current = conflictWith.content;
+    setContent(conflictWith.content);
+    setConflictWith(null);
+    setProblem(null);
+    setStatus('onDisk');
+  }, [conflictWith]);
 
   // Recomputed on every keystroke — parsing+resolving one note's handful of
   // links against ~40 paths is trivial, no debounce needed here (the
@@ -290,7 +316,14 @@ export default function NoteEditor({
         </div>
         <div className="flex shrink-0 items-center gap-3">
           <LinksMenu links={links} notes={notes} />
-          <SaveStatus status={status} commit={commit} problem={problem} onRetry={saveNow} />
+          <SaveStatus
+            status={status}
+            commit={commit}
+            problem={problem}
+            onRetry={saveNow}
+            onKeepMine={keepMine}
+            onLoadTheirs={loadTheirs}
+          />
         </div>
       </header>
 
@@ -362,11 +395,15 @@ function SaveStatus({
   commit,
   problem,
   onRetry,
+  onKeepMine,
+  onLoadTheirs,
 }: {
   status: Status;
   commit: string | null;
   problem: string | null;
   onRetry: () => void;
+  onKeepMine: () => void;
+  onLoadTheirs: () => void;
 }) {
   if (status === 'clean') return null;
 
@@ -416,10 +453,25 @@ function SaveStatus({
     );
   }
 
+  if (status === 'conflict') {
+    return (
+      <p className={`${pill} bg-red-500/10 text-red-400`} role="status" title={problem ?? undefined}>
+        <span className="size-1.5 rounded-full bg-red-400" />
+        Changed elsewhere
+        <button type="button" onClick={onKeepMine} className="ml-1 underline hover:text-red-300">
+          Keep mine
+        </button>
+        <button type="button" onClick={onLoadTheirs} className="underline hover:text-red-300">
+          Load theirs
+        </button>
+      </p>
+    );
+  }
+
   return (
     <p className={`${pill} bg-red-500/10 text-red-400`} role="status" title={problem ?? undefined}>
       <span className="size-1.5 rounded-full bg-red-400" />
-      {status === 'conflict' ? 'Changed elsewhere' : 'Save failed'}
+      Save failed
       <button type="button" onClick={onRetry} className="ml-1 underline hover:text-red-300">
         Retry
       </button>

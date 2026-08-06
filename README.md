@@ -154,21 +154,37 @@ exactly that. It does not invent intent it never observed.
 
 ## What works, and what does not
 
-Honest scope, since this was time-boxed.
+Honest scope, since this was time-boxed. Full reasoning for all of it is in
+[DECISIONS.md](./DECISIONS.md), including a section on what's skipped and
+what would come first with more time.
 
-**Working**
+**Working — all four rules, all five features**
 
 - **All 36 files open and save.** Spaces, parentheses, an emoji, five non-`.md`
   extensions, and the hidden `notes/drafts/.scratch/` folder are all included. A
   note is any file under `notes/` that Git will track, so the repo's own
   `.gitignore` decides what counts rather than a hardcoded list.
-- **Nested folder tree** showing each note's title from `.noteindex.json` rather
-  than its filename; filename and full path are in the hover tooltip.
+- **Nested folder tree** showing each note's filename (not a computed title —
+  the identifier you'd actually type in a `[[wiki link]]`), with title and
+  full path in the hover tooltip.
+- **Create, rename, move, and delete**, each a real `git mv`/`git rm`
+  commit. Rename and move rewrite every link that safely can be (direct
+  links to the moved note), warn before touching anything that can't
+  (a link elsewhere this move would make ambiguous), and never touch a link
+  silently either way.
+- **Delete is undoable.** A toast right after the delete, and a persistent
+  Trash view for anything further back — both restore via `git revert`.
+  Deleting warns about, but never rewrites, notes that link to what's being
+  deleted; rewriting would destroy the information undo needs to put those
+  links back exactly as they were.
 - **Autosave, then commit**, as described above.
-- **Concurrent-edit detection.** Every save carries a SHA-256 of the bytes it
-  started from. A save whose base no longer matches is refused with `409` and the
-  current content is returned rather than overwritten, so two tabs cannot
-  silently clobber each other.
+- **Concurrent-edit detection and resolution.** Every save carries a SHA-256
+  of the bytes it started from; a stale save is refused with `409` rather
+  than silently overwriting. The write path itself is serialized through the
+  same lock every other repo-touching operation uses, closing a real
+  check-then-write race two truly concurrent saves could otherwise both pass.
+  On a real conflict the editor shows what's actually on disk and offers two
+  explicit choices — keep mine or load theirs — never a silent pick.
 - **Line endings preserved per file.** This repo is checked out with
   `core.autocrlf=true`, so every file is CRLF on disk while a browser textarea
   normalises to LF. Without this, one edit would rewrite every line of the file.
@@ -178,15 +194,11 @@ Honest scope, since this was time-boxed.
   ambiguous targets are surfaced in the editor rather than silently rendered.
   Backlinks for a note are available at `/api/note/backlinks`.
 
-**Not built**
-
-- **Create, rename, move, and delete.** The link resolution needed to make a
-  rename safe is in place, but the mutations themselves are not, so Rule 3's
-  rewrite half and Rule 4 are unimplemented. Nothing in the app calls `git mv` or
-  `git rm`.
-- **The conflict resolution interface.** The `409` is detected and surfaced as a
-  "Changed elsewhere" state with a retry, but there is no side-by-side diff or
-  merge UI.
+**Known limitations** — see `dev-notes/known-bugs.md` for the specifics;
+none of them lose data or corrupt the repo. The biggest deliberate scope
+line: conflict resolution is "detect and warn" (one of the three approaches
+the brief names as sufficient), not a real merge — `DECISIONS.md` covers why,
+and what a merge would take.
 
 ---
 
@@ -199,20 +211,37 @@ src/
 │   ├── api/note/route.ts         GET and PUT a note's text
 │   ├── api/note/status/route.ts  has this note reached history yet?
 │   ├── api/note/backlinks/       what points at this note
+│   ├── api/note/link-impact/     what a rename/move would fix or break
+│   ├── api/note/rename/          git mv — also the move endpoint
+│   ├── api/note/delete/          git rm, with a dangling-links summary
+│   ├── api/note/restore/         git revert a delete
+│   ├── api/note/trash/           un-restored deletes, for the Trash panel
 │   └── page.tsx                  tree + editor; ?path= selects the open note
 ├── components/
-│   ├── NoteTree.tsx              nested sidebar
-│   ├── NoteEditor.tsx            editor, autosave, save/commit status
+│   ├── AppShell.tsx              sidebar/editor-spanning state: create, rename,
+│   │                             move, delete, undo, every modal and toast
+│   ├── NoteTree.tsx              nested sidebar, drag-and-drop
+│   ├── NoteEditor.tsx            editor, autosave, save/commit/conflict status
+│   ├── RowContextMenu.tsx        per-row Rename / Move to… / Delete
+│   ├── LinkImpactModal.tsx       what a rename/move affects, before it happens
+│   ├── MoveToDialog.tsx          keyboard-accessible move
+│   ├── DeleteConfirmDialog.tsx   destructive confirm, dangling-link warning
+│   ├── Toast.tsx  TrashPanel.tsx undo, right after and later
 │   └── editor/                   link decorations, links panel, ambiguity overlay
 ├── lib/
-│   ├── links/                    parse, resolve, and invert the link graph (pure)
+│   ├── links/                    parse, resolve, invert, and rewrite the link
+│   │                             graph (pure) — fixable vs. unfixable on a move
 │   ├── paths.ts  titles.ts  tree.ts
 │   └── server/                   all filesystem and git access lives here
 │       ├── config.ts             where the notes repo is, and whether it is valid
 │       ├── git.ts                git handle scoped to the notes repo
 │       ├── notes.ts              read and write, with the hash guard
 │       ├── sessions.ts           when an edit becomes a commit
-│       ├── commit.ts             the git plumbing underneath that
+│       ├── structural.ts         create/rename/move/delete/restore — quiesce
+│       │                         open sessions first, then mutate, then commit
+│       ├── trash.ts              which deletes have no later restore
+│       ├── link-index.ts         repo-wide link index, backlink summaries
+│       ├── commit.ts             the git plumbing underneath all of the above
 │       ├── recovery.ts           what to do about a dirty tree at startup
 │       ├── mutex.ts              one repo-changing operation at a time
 │       ├── index-file.ts         .noteindex.json

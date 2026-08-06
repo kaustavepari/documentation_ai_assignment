@@ -1,9 +1,10 @@
 # Known bugs
 
-Found during manual testing and triage'd rather than fixed on the spot,
-since none of them lose data or corrupt the repo — they're UI-level. Left
-open at submission time; listed here rather than left for someone else to
-rediscover.
+Found during manual testing. Bugs 1–4 are triage'd rather than fixed —
+none of them lose data or corrupt the repo, they're UI-level — and are
+left open at submission time. Bug 5 is different in kind (a real data-loss
+race, not a UI issue) and is fixed; kept here for the record rather than
+dropped once resolved.
 
 ---
 
@@ -104,3 +105,48 @@ part.
 recent un-restored delete per current path, or the panel needs to make the
 relationship between stacked deletes of the same path explicit instead of
 presenting them as two unrelated, independently restorable items.
+
+## 5. `writeNote`'s check-then-write was not atomic — two concurrent saves could silently lose one — FIXED
+
+**Status: Fixed.** Data-loss bug in the exact mechanism Rule 2 depends on,
+found during a final review pass, not left open like 1–4 above.
+
+**Repro (deterministic, not timing-dependent):**
+1. Open a note, note its `hash` (call it `H0`).
+2. From server-side code (or two near-simultaneous browser tabs saving at
+   the same instant), fire two saves in parallel, both with `baseHash: H0`
+   but different content:
+   ```ts
+   const [a, b] = await Promise.all([
+     writeNote(path, contentA, H0),
+     writeNote(path, contentB, H0),
+   ]);
+   ```
+
+**Expected:** exactly one save succeeds (`ok: true`); the other gets the
+`conflict` result (`ok: false, reason: 'conflict'`), since its `baseHash`
+no longer matches what the first save just wrote.
+
+**Actual (before the fix):** both calls returned `ok: true`. `writeNote`
+did `fs.readFile` → compare hash → `fs.writeFile` with nothing serializing
+the sequence, so both concurrent calls could read the same on-disk bytes,
+both see their `baseHash` match, and both write — the second one winning
+silently. Confirmed by inspecting the final file content: tab A's entire
+edit was gone, with no trace and no error surfaced to either caller.
+
+**Root cause:** a classic check-then-act (TOCTOU) race. Every other place
+this app touches the repo — commits, structural operations (rename/move/
+delete/restore) — already serializes through one shared lock (`repoLock`
+in `lib/server/mutex.ts`). `writeNote` in `lib/server/notes.ts` was the one
+write path that had never been brought under it.
+
+**Fix:** `writeNote` now runs its whole body inside `repoLock.run(...)`,
+same as every other repo-touching operation. Verified the fix closes the
+race by re-running the exact repro above against a scratch clone, twice:
+one call now consistently succeeds and the other consistently gets the
+conflict result, every time — a lock-based fix is deterministic, not
+probabilistic, so this isn't "less likely to happen," it cannot happen.
+
+**How to re-verify:** the repro above, run directly against `writeNote`
+(no server needed) — a stale hash's `Promise.all` pair should always split
+one `ok: true` / one `ok: false, reason: 'conflict'`.

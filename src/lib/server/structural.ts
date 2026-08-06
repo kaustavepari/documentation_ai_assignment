@@ -222,7 +222,7 @@ export async function renameNote({
   });
 }
 
-export type DeleteResult = { sha: string; short: string; message: string };
+export type DeleteResult = { sha: string; short: string; message: string; title: string };
 
 export async function deleteNote({ path: relPath }: { path: string }): Promise<DeleteResult> {
   return withQuiescedTransaction(async () => {
@@ -261,7 +261,7 @@ export async function deleteNote({ path: relPath }: { path: string }): Promise<D
       const sha = await commitStructural([INDEX_PATHSPEC], [relPath, INDEX_PATHSPEC], message);
 
       endSession(relPath);
-      return { sha, short: await shortSha(sha), message };
+      return { sha, short: await shortSha(sha), message, title: note.title };
     } catch (error) {
       await rollbackStructural([relPath, INDEX_PATHSPEC], []);
       throw error;

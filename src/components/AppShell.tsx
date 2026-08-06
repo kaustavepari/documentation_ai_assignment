@@ -3,12 +3,14 @@
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 
+import DeleteConfirmDialog from '@/components/DeleteConfirmDialog';
 import { PlusFileIcon, PlusFolderIcon } from '@/components/icons';
 import LinkImpactModal from '@/components/LinkImpactModal';
 import MoveToDialog from '@/components/MoveToDialog';
 import NoteTree, { type PendingCreate } from '@/components/NoteTree';
 import RowContextMenu from '@/components/RowContextMenu';
 import type { FixableLink, UnfixableLink } from '@/lib/links/rewrite';
+import type { Backlink } from '@/lib/links/types';
 import { dirName, baseName, renameVerb } from '@/lib/paths';
 import { filePathsOf, folderPathsOf, withClientFile, withClientFolder, type TreeNode } from '@/lib/tree';
 
@@ -21,12 +23,26 @@ type LinkImpactState = {
   error: string | null;
 };
 
+type DeleteState = {
+  path: string;
+  backlinks: Backlink[];
+  busy: boolean;
+  error: string | null;
+};
+
 async function requestJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? 'Request failed.');
+  return data as T;
+}
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? 'Request failed.');
   return data as T;
@@ -77,6 +93,10 @@ export default function AppShell({
   // worth asking about, in which case the rename already went straight through.
   const [linkImpact, setLinkImpact] = useState<LinkImpactState | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
+  // The note showing the delete confirmation dialog — always shown on
+  // trigger (unlike rename's link-impact modal, which fast-paths when
+  // nothing's affected): deleting is destructive regardless of impact.
+  const [deleteTarget, setDeleteTarget] = useState<DeleteState | null>(null);
 
   // Both graduate to real the moment the server-fetched tree already
   // contains them — drop the ephemeral copy rather than showing it twice.
@@ -205,6 +225,38 @@ export default function AppShell({
     }
   };
 
+  const startDelete = async (path: string) => {
+    setRenameError(null);
+    setContextMenu(null);
+    try {
+      const summary = await getJson<{ path: string; count: number; backlinks: Backlink[] }>(
+        `/api/note/backlinks?path=${encodeURIComponent(path)}`,
+      );
+      setDeleteTarget({ path, backlinks: summary.backlinks, busy: false, error: null });
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : 'Delete failed.');
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    const { path } = deleteTarget;
+    setDeleteTarget({ ...deleteTarget, busy: true, error: null });
+    try {
+      await requestJson('/api/note/delete', { path });
+      setDeleteTarget(null);
+      if (selected === path) {
+        router.push('/');
+      } else {
+        router.refresh();
+      }
+    } catch (error) {
+      setDeleteTarget((prev) =>
+        prev ? { ...prev, busy: false, error: error instanceof Error ? error.message : 'Delete failed.' } : prev,
+      );
+    }
+  };
+
   return (
     <div className="flex min-h-0 flex-1">
       <nav className="flex w-72 shrink-0 flex-col overflow-y-auto border-r border-line bg-surface">
@@ -272,6 +324,7 @@ export default function AppShell({
           y={contextMenu.y}
           onRename={() => startRename(contextMenu.path)}
           onMoveTo={() => startMove(contextMenu.path)}
+          onDelete={() => startDelete(contextMenu.path)}
           onDismiss={() => setContextMenu(null)}
         />
       )}
@@ -296,6 +349,17 @@ export default function AppShell({
           onFix={() => resolveLinkImpact(true)}
           onLeave={() => resolveLinkImpact(false)}
           onCancel={() => setLinkImpact(null)}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteConfirmDialog
+          path={deleteTarget.path}
+          backlinks={deleteTarget.backlinks}
+          busy={deleteTarget.busy}
+          error={deleteTarget.error}
+          onConfirm={confirmDelete}
+          onCancel={() => setDeleteTarget(null)}
         />
       )}
     </div>

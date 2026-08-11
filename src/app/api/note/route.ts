@@ -1,6 +1,6 @@
 import { readNote, writeNote } from '@/lib/server/notes';
 import { PathError } from '@/lib/server/paths';
-import { flushSession, isPending, touchSession } from '@/lib/server/sessions';
+import { endSession, flushSession, isPending, touchSession } from '@/lib/server/sessions';
 
 /**
  * Notes are addressed by their full repo-relative path, passed as a single
@@ -35,7 +35,18 @@ export async function GET(request: Request) {
  * ordinary habit of popping over to another note and back into one commit per
  * lookup.
  */
-type SaveRequest = { path: string; content: string; baseHash: string; flush?: boolean };
+type SaveRequest = {
+  path: string;
+  content: string;
+  baseHash: string;
+  flush?: boolean;
+  /**
+   * Set only by the retried write inside the client's "Keep mine" conflict
+   * resolution: this PUT is about to overwrite whatever is currently on
+   * disk, so that content must be preserved in history first — see below.
+   */
+  resolvingConflict?: boolean;
+};
 
 export async function PUT(request: Request) {
   let body: SaveRequest;
@@ -45,7 +56,7 @@ export async function PUT(request: Request) {
     return Response.json({ error: 'Body must be JSON.' }, { status: 400 });
   }
 
-  const { path, content, baseHash, flush } = body ?? {};
+  const { path, content, baseHash, flush, resolvingConflict } = body ?? {};
   if (typeof path !== 'string' || typeof content !== 'string' || typeof baseHash !== 'string') {
     return Response.json(
       { error: 'Expected { path, content, baseHash } as strings.' },
@@ -54,6 +65,35 @@ export async function PUT(request: Request) {
   }
 
   try {
+    if (resolvingConflict) {
+      try {
+        // The content on disk right now is about to be clobbered by the
+        // overwrite below. flushSession snapshots it into its own commit if
+        // it isn't already there (no-op if it is) — this is what actually
+        // makes "Keep mine" safe: without it, a version that never made it
+        // past the 15s idle-commit window would be lost with no trace.
+        await flushSession(path);
+      } catch {
+        // Unlike the ordinary post-write flush (which only risks the
+        // caller's own new work, still safe on disk either way), a failure
+        // here means we cannot prove the *other* version survives. Fail
+        // closed: refuse the overwrite rather than risk destroying it.
+        return Response.json(
+          {
+            error: 'Could not preserve the current version before overwriting it. Nothing was changed — try again.',
+          },
+          { status: 500 },
+        );
+      }
+      // Required even when flushSession found nothing dirty to commit: a
+      // session that was already clean stays open with its prior commit sha
+      // attached, and the ordinary touchSession()/flush below would then
+      // amend *that* commit — silently folding the just-preserved version
+      // into the overwrite and defeating the safety commit above. Ending
+      // the session forces the overwrite to start a fresh one.
+      endSession(path);
+    }
+
     const result = await writeNote(path, content, baseHash);
     if (!result.ok) {
       // 409 is the honest status: the request was well-formed, the note simply

@@ -22,6 +22,14 @@ const LOG_LIMIT = 300;
  *     correctly matched even if git would now print a longer short-sha for
  *     it than it did at restore time.
  *
+ * A path can legitimately have more than one un-restored `Delete "..."`
+ * commit in history (deleted, recreated, deleted again) — only the most
+ * recent one reflects what's actually restorable, since restoring an older
+ * one would revert a commit several generations behind that path's current
+ * state. `git log` returns commits most-recent-first, so the first delete
+ * seen for a given path is already the right one to keep; earlier (older)
+ * deletes of the same path are skipped.
+ *
  * Bounded to the last 300 commits — same "don't build for 10,000 notes"
  * reasoning the rest of this project holds itself to.
  */
@@ -49,6 +57,7 @@ export async function listTrash(): Promise<TrashEntry[]> {
   }
 
   const entries: TrashEntry[] = [];
+  const seenPaths = new Set<string>();
   for (const { sha, subject } of commits) {
     if (!subject.startsWith('Delete "') || restoredShas.has(sha)) continue;
 
@@ -60,6 +69,12 @@ export async function listTrash(): Promise<TrashEntry[]> {
       .map((line) => line.trim())
       .find(Boolean);
     if (!deletedPath) continue;
+
+    // Commits are most-recent-first, so the first un-restored delete seen
+    // for a path is the one that reflects its current state; skip any
+    // older un-restored deletes of the same path.
+    if (seenPaths.has(deletedPath)) continue;
+    seenPaths.add(deletedPath);
 
     const titleMatch = subject.match(/^Delete "(.*)" — /);
     const title = titleMatch ? titleMatch[1] : baseName(deletedPath);

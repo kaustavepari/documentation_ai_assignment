@@ -1,6 +1,5 @@
 import { planLinkRewrite } from '@/lib/links/rewrite';
-import { listNotes } from '@/lib/server/index-file';
-import { buildRepoLinkIndex } from '@/lib/server/link-index';
+import { buildRenamePlanInputs } from '@/lib/server/link-index';
 import { PathError } from '@/lib/server/paths';
 
 /**
@@ -25,9 +24,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const [index, notes] = await Promise.all([buildRepoLinkIndex(), listNotes()]);
-    const notePaths = notes.map((n) => n.path);
-    const titleByPath = new Map(notes.map((n) => [n.path, n.title]));
+    const { index, notePaths, titleByPath } = await buildRenamePlanInputs();
     const plan = planLinkRewrite(index, oldPath, newPath, notePaths, titleByPath);
     return Response.json(plan);
   } catch (error) {

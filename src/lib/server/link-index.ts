@@ -29,6 +29,26 @@ export async function buildRepoLinkIndex(): Promise<LinkIndex> {
   return computeLinkIndex(sources, repoFiles, titleByPath);
 }
 
+/**
+ * The inputs a rename/move plan needs: the repo's link index, plus the
+ * note-path list and title lookup `planLinkRewrite` takes as separate
+ * arguments. Both the `link-impact` preview route and `renameNote` need
+ * exactly this bundle, computed from the same `listNotes()` call — pulled
+ * out here so there's one place that assembles it instead of two.
+ */
+export async function buildRenamePlanInputs(): Promise<{
+  index: LinkIndex;
+  notePaths: string[];
+  titleByPath: Map<string, string>;
+}> {
+  const [index, notes] = await Promise.all([buildRepoLinkIndex(), listNotes()]);
+  return {
+    index,
+    notePaths: notes.map((n) => n.path),
+    titleByPath: new Map(notes.map((n) => [n.path, n.title])),
+  };
+}
+
 export type BacklinkSummary = { path: string; count: number; backlinks: Backlink[] };
 
 /**

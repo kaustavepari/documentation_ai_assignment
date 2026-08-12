@@ -6,20 +6,17 @@ import path from 'node:path';
 
 import { NEW_FILE_HASH } from '../paths';
 import { titleFor } from '../titles';
+import { toAppContent, toDiskContent } from './eol';
 import { repoLock } from './mutex';
 import { PathError, resolveInRepo } from './paths';
-
-/** Line endings, preserved per file. See `readNote`. */
-export type Eol = '\r\n' | '\n';
 
 export type Note = {
   path: string;
   title: string;
-  /** Always LF, whatever is on disk. */
+  /** Always LF. */
   content: string;
   /** SHA-256 of the bytes on disk, not of `content`. */
   hash: string;
-  eol: Eol;
 };
 
 /**
@@ -49,31 +46,24 @@ export function resolveNotePath(relPath: string): string {
   return resolveInRepo(clean);
 }
 
-/**
- * This repo is checked out with `core.autocrlf=true`, so all 36 files are CRLF
- * on disk while git stores LF. A browser `<textarea>` normalises its value to
- * LF, so a naive read/write round-trip would rewrite every line of every file
- * we touch and turn each real edit into a whole-file diff.
- *
- * So: normalise to LF on the way out, restore the file's own ending on the way
- * back in. The app never decides what line endings a file should have — it
- * only preserves what it found.
- */
-export function detectEol(text: string): Eol {
-  return text.includes('\r\n') ? '\r\n' : '\n';
-}
-
-export function toEol(content: string, eol: Eol): string {
-  return eol === '\r\n' ? content.replace(/\r?\n/g, '\r\n') : content.replace(/\r\n/g, '\n');
-}
-
 export async function readNote(relPath: string): Promise<Note> {
   const bytes = await fs.readFile(resolveNotePath(relPath));
   const raw = bytes.toString('utf8');
-  const eol = detectEol(raw);
-  const content = raw.replace(/\r\n/g, '\n');
+  const content = toAppContent(raw);
 
-  return { path: relPath, title: titleFor(relPath, content), content, hash: hashOf(bytes), eol };
+  return { path: relPath, title: titleFor(relPath, content), content, hash: hashOf(bytes) };
+}
+
+/**
+ * Overwrite an existing note's content, preserving its on-disk line-ending
+ * convention. No conflict check — for mechanical rewrites (link-target
+ * fixups during a rename) where the caller already holds `repoLock` and
+ * already knows the file exists.
+ */
+export async function writeNoteContentLocked(relPath: string, content: string): Promise<void> {
+  const abs = resolveNotePath(relPath);
+  const current = await fs.readFile(abs, 'utf8');
+  await fs.writeFile(abs, Buffer.from(toDiskContent(content, current), 'utf8'));
 }
 
 export type SaveResult =
@@ -138,11 +128,11 @@ async function writeNoteLocked(
       ok: false,
       reason: 'conflict',
       currentHash,
-      currentContent: current.toString('utf8').replace(/\r\n/g, '\n'),
+      currentContent: toAppContent(current.toString('utf8')),
     };
   }
 
-  const bytes = Buffer.from(toEol(content, detectEol(current.toString('utf8'))), 'utf8');
+  const bytes = Buffer.from(toDiskContent(content, current.toString('utf8')), 'utf8');
   await fs.writeFile(abs, bytes);
 
   return { ok: true, hash: hashOf(bytes), title: titleFor(relPath, content) };
@@ -178,7 +168,7 @@ async function createNote(abs: string, relPath: string, content: string): Promis
       ok: false,
       reason: 'conflict',
       currentHash: hashOf(current),
-      currentContent: current.toString('utf8').replace(/\r\n/g, '\n'),
+      currentContent: toAppContent(current.toString('utf8')),
     };
   }
 

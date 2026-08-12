@@ -5,8 +5,9 @@ import fs from 'node:fs/promises';
 import { INDEX_FILE } from './config';
 import { titleFor } from '../titles';
 import type { NoteEntry } from '../tree';
+import { toDiskContent } from './eol';
 import { listNoteFiles } from './walk';
-import { detectEol, readNote, type Eol } from './notes';
+import { readNote } from './notes';
 
 export type IndexEntry = { path: string; title: string };
 
@@ -32,7 +33,7 @@ export async function readIndex(): Promise<IndexEntry[]> {
  * and rewriting it in a different order would produce a whole-file diff every
  * time a note is added.
  */
-export function serializeIndex(entries: IndexEntry[], eol: Eol): string {
+export function serializeIndex(entries: IndexEntry[]): string {
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   const lines = sorted.map(
     ({ path, title }, i) =>
@@ -40,7 +41,7 @@ export function serializeIndex(entries: IndexEntry[], eol: Eol): string {
         i === sorted.length - 1 ? '' : ','
       }`,
   );
-  return ['[', ...lines, ']', ''].join(eol);
+  return ['[', ...lines, ']', ''].join('\n');
 }
 
 /**
@@ -54,7 +55,7 @@ export function serializeIndex(entries: IndexEntry[], eol: Eol): string {
  */
 export async function writeIndex(entries: IndexEntry[]): Promise<void> {
   const existing = await fs.readFile(INDEX_FILE, 'utf8').catch(() => '');
-  await fs.writeFile(INDEX_FILE, serializeIndex(entries, detectEol(existing)), 'utf8');
+  await fs.writeFile(INDEX_FILE, toDiskContent(serializeIndex(entries), existing), 'utf8');
 }
 
 /**

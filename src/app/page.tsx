@@ -40,7 +40,7 @@ export default async function Home(props: PageProps<'/'>) {
         // its validation, so a path that escapes `notes/` fails the same way
         // an ordinary open would rather than silently stubbing anything.
         resolveNotePath(selected);
-        note = { path: selected, title: titleFor(selected, ''), content: '', hash: NEW_FILE_HASH, eol: '\n' as const };
+        note = { path: selected, title: titleFor(selected, ''), content: '', hash: NEW_FILE_HASH };
       } else {
         note = await readNote(selected);
       }

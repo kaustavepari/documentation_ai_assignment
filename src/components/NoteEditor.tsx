@@ -11,6 +11,7 @@ import ConflictDialog from '@/components/ConflictDialog';
 import DiscardToast from '@/components/DiscardToast';
 import LinksMenu from '@/components/editor/LinksMenu';
 import { linkDecorations, type AmbiguousLink } from '@/components/editor/linkDecorations';
+import { COMMIT_CHECK_MS } from '@/lib/commitTiming';
 import { dirName, NEW_FILE_HASH } from '@/lib/paths';
 import { parseLinks } from '@/lib/links/parse';
 import { resolveLink } from '@/lib/links/resolve';
@@ -60,15 +61,6 @@ function discardKeyFor(path: string): string {
 
 /** Long enough not to fire mid-word, short enough that nobody notices waiting. */
 const AUTOSAVE_DELAY_MS = 800;
-
-/**
- * When to ask whether the commit has landed.
- *
- * The server commits after 15s of quiet. Nothing is in flight at that moment,
- * so the pill would otherwise sit on "Saved to disk" forever even though the
- * work reached history. One poll, slightly after the server's own window.
- */
-const COMMIT_CHECK_MS = 16_000;
 
 /**
  * The editor and its autosave.

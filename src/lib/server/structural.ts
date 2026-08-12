@@ -8,10 +8,10 @@ import { applySplices, buildSplicesForFile, planLinkRewrite } from '../links/rew
 import { INDEX_PATHSPEC } from './config';
 import { commitPaths, headSha, shortSha, stagePaths, subject } from './commit';
 import { git } from './git';
-import { buildIndexEntries, listNotes, writeIndex } from './index-file';
-import { buildRepoLinkIndex, getBacklinkSummary } from './link-index';
+import { buildIndexEntries, writeIndex } from './index-file';
+import { buildRenamePlanInputs, getBacklinkSummary } from './link-index';
 import { repoLock } from './mutex';
-import { readNote, resolveNotePath, toEol } from './notes';
+import { readNote, resolveNotePath, writeNoteContentLocked } from './notes';
 import { PathError } from './paths';
 import { endSession, flushAll } from './sessions';
 
@@ -170,9 +170,7 @@ export async function renameNote({
 
     const title = (await readNote(oldPath)).title;
 
-    const [index, notes] = await Promise.all([buildRepoLinkIndex(), listNotes()]);
-    const notePaths = notes.map((n) => n.path);
-    const titleByPath = new Map(notes.map((n) => [n.path, n.title]));
+    const { index, notePaths, titleByPath } = await buildRenamePlanInputs();
     const plan = planLinkRewrite(index, oldPath, newPath, notePaths, titleByPath);
 
     const touchedLinkFiles = rewriteLinks ? [...new Set(plan.fixable.map((f) => f.sourcePath))] : [];
@@ -199,7 +197,7 @@ export async function renameNote({
 
         const note = await readNote(readPath);
         const rewritten = applySplices(note.content, splices);
-        await fs.writeFile(resolveNotePath(readPath), Buffer.from(toEol(rewritten, note.eol), 'utf8'));
+        await writeNoteContentLocked(readPath, rewritten);
         rewrittenFiles.push(readPath);
       }
 

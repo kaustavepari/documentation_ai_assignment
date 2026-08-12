@@ -2,6 +2,7 @@ import 'server-only';
 
 import fs from 'node:fs/promises';
 
+import { COMMIT_IDLE_MS } from '../commitTiming';
 import { titleFor } from '../titles';
 import {
   commitPaths,
@@ -15,6 +16,7 @@ import {
   wordStat,
 } from './commit';
 import { INDEX_PATHSPEC } from './config';
+import { toAppContent } from './eol';
 import { git } from './git';
 import { buildIndexEntries, writeIndex } from './index-file';
 import { repoLock } from './mutex';
@@ -40,9 +42,6 @@ import { resolveInRepo } from './paths';
  * intent; git only records it. The one place that does look at a flat dirty
  * tree is startup recovery, and it refuses to guess (see `recovery.ts`).
  */
-
-/** Idle gap after which a note's work is written to history. */
-const COMMIT_IDLE_MS = 15_000;
 
 /**
  * After this long, a session's commit stops being amended and finalises.
@@ -216,7 +215,7 @@ async function commitSession(session: Session): Promise<CommitInfo | null> {
   }
 
   const baseContent = await showAtCommit(base, path);
-  const currentTitle = titleFor(path, current.replace(/\r\n/g, '\n'));
+  const currentTitle = titleFor(path, toAppContent(current));
 
   // Staged before measuring: a note git has never tracked is invisible to
   // `git diff`, so a freshly created one would report zero words.
@@ -234,7 +233,7 @@ async function commitSession(session: Session): Promise<CommitInfo | null> {
     message = subject(`Create "${currentTitle}" — ${path}${stat ? ` ${stat}` : ''}`);
     paths.push(INDEX_PATHSPEC);
   } else {
-    const baseTitle = titleFor(path, baseContent.replace(/\r\n/g, '\n'));
+    const baseTitle = titleFor(path, toAppContent(baseContent));
     if (baseTitle !== currentTitle) {
       message = subject(`Retitle "${baseTitle}" → "${currentTitle}"`);
       paths.push(INDEX_PATHSPEC);

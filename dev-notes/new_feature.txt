@@ -1,0 +1,67 @@
+Staged Changes and Explicit Commit
+Documentation.AI · Product Engineer · Live build session
+
+Light / dark
+Duration	50 minutes of build time
+Codebase	Your own take-home submission
+AI tools	Expected and encouraged
+Deliverables	Your repo, plus your exported agent session
+Take a few minutes to read this before you start. The 50 minutes begins when you start building, not now.
+
+Context
+In your app, the decision to commit belongs to the code rather than to the user. Whatever triggers a save, the commit follows from it automatically, and every structural change, creating a note, renaming, moving, deleting, goes straight into git the moment it happens.
+
+That leaves a gap. A user reorganising their notes will create a file, rename two others, move a folder and delete something stale as a single piece of work over about two minutes. Today that produces five or six separate commits, and there is no point at which the user gets to look at the whole thing and say "yes, that is the change I meant to make."
+
+Goal
+Put a staging layer between the user's actions and the repository.
+
+Changes are held in local state. The user can see what is pending. Git is written only when the user commits.
+
+Requirements
+Staging. All mutating operations are staged rather than written to git: create, edit, rename, move, delete.
+Explicit commit. A Commit action writes everything staged. Nothing reaches git before that.
+Durability. Staged changes survive a page reload. IndexedDB is required for this.
+Visibility. The user can see what is staged and how many changes are pending.
+Consistent reads. The app reflects staged state wherever it shows notes. A note staged for deletion is not in the tree. A note staged for rename appears under its new name. A note with staged edits opens showing them.
+Net effect. The commit reflects the net result of the staged work, not a replay of every step.
+Discard. The user can abandon staged changes and return to the committed state.
+Acceptance criteria
+We will ask you to demo these.
+
+Edit a note. git log is unchanged. The pending count reflects it.
+Reload the page. The staged edit is still there, still pending.
+Stage a create, a rename and a delete. All three show as pending, git log still unchanged.
+Commit. The repository reflects all of it and git status is clean.
+Create a note and delete that same note while staged, then commit. The repository is unchanged.
+.noteindex.json is correct after commit, with its original formatting intact.
+Constraints
+IndexedDB is mandatory for staged changes. Not localStorage.
+
+State management is your choice. Context, a reducer, Zustand, Redux, Jotai, or your own. We care that the choice is deliberate and that you can defend it.
+
+Keep your existing stack otherwise. This is an extension, not a rewrite.
+
+Not in scope
+Undo and redo history. Branching or named change sets. New conflict resolution UI. Syncing between tabs or devices. Auth. Tests. Deployment. Visual redesign.
+
+Order of work
+You will not finish all of this in 50 minutes and we do not expect you to. Build outward in this order.
+
+Edits staged in IndexedDB, a pending indicator, a working Commit button, surviving reload.
+Create, rename, move and delete brought into the same staging model.
+Requirement 5, so every read reflects staged state.
+Requirements 6 and 7, net effect and discard.
+Expect to land somewhere in stage two. That is a good outcome. Do not rush ahead to touch every requirement. Tell us what you skipped and why.
+
+What we are looking at
+How you understand the feature before you build it. Whether you find the edge cases yourself or meet them when something breaks. How you research, meaning whether you go and read your own code or work from assumption.
+
+And how you work with your agent. We want to see engineering rather than dictation: loading context before asking for code, stating your constraints, keeping requests scoped, rejecting output with a reason, and checking what comes back. We are also interested in whether you can tell when the agent is wrong, and what you do next.
+
+Deliverables
+Your repository, work committed, real history intact.
+
+Your exported agent session. We will ask for this at the end, so please send it before you drop off. Claude Code uses /export; Cursor exports from the thread menu.
+
+If something here is ambiguous, make a call, note it, and tell us your reasoning during the session.

@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
+import { StagingProvider } from "@/components/staging/StagingProvider";
+
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
@@ -23,7 +25,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="flex h-full flex-col overflow-hidden">{children}</body>
+      <body className="flex h-full flex-col overflow-hidden">
+        <StagingProvider>{children}</StagingProvider>
+      </body>
     </html>
   );
 }

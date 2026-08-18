@@ -7,14 +7,13 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import AmbiguousLinkOverlay from '@/components/editor/AmbiguousLinkOverlay';
-import ConflictDialog from '@/components/ConflictDialog';
-import DiscardToast from '@/components/DiscardToast';
 import LinksMenu from '@/components/editor/LinksMenu';
 import { linkDecorations, type AmbiguousLink } from '@/components/editor/linkDecorations';
-import { COMMIT_CHECK_MS } from '@/lib/commitTiming';
-import { dirName, NEW_FILE_HASH } from '@/lib/paths';
+import { useStaging } from '@/components/staging/StagingProvider';
+import { dirName } from '@/lib/paths';
 import { parseLinks } from '@/lib/links/parse';
 import { resolveLink } from '@/lib/links/resolve';
+import { effectiveContent } from '@/lib/staging/fold';
 
 /**
  * Clears CodeMirror's own defaults (a light background, its own font stack)
@@ -49,237 +48,120 @@ const editorTheme = EditorView.theme(
 type EditableNote = { path: string; title: string; content: string; hash: string };
 type NoteEntry = { path: string; title: string };
 
-type Status = 'clean' | 'editing' | 'saving' | 'onDisk' | 'committed' | 'error' | 'conflict';
-
-/** `/api/note/status`'s response shape — see that route for what each field means. */
-type NoteStatus = { pending: boolean; commit: string | null; hash: string | null };
-
-/** sessionStorage key for a note's most recently discarded ("Load theirs") text. */
-function discardKeyFor(path: string): string {
-  return `note-editor:discarded:${path}`;
-}
+type Status = 'clean' | 'editing' | 'pending';
 
 /** Long enough not to fire mid-word, short enough that nobody notices waiting. */
-const AUTOSAVE_DELAY_MS = 800;
+const STAGE_DELAY_MS = 800;
 
 /**
- * The editor and its autosave.
+ * The editor. Typing here no longer touches the real repository at all — see
+ * `dev-notes/staging-layer-spec.md`. Every change is held in the staging
+ * layer (`StagingProvider`, durable via IndexedDB) and shown as if it had
+ * already happened; nothing reaches disk or git until a Commit action
+ * (ticket 02) replays it through the app's existing save pipeline.
  *
- * This is the durability half of the design: typing puts bytes on disk. When
- * a change becomes a commit is a separate decision that hooks into the
- * server's save path, so this component only has to *report* which of the two
- * guarantees currently holds.
- *
- * Keyed by note path upstream, so switching notes remounts it and no state can
- * leak between two files.
+ * Split into an outer component that waits on `useStaging().ready` and an
+ * inner one that owns the actual editing state: the inner component's
+ * initial state is seeded from whatever's staged for this note, and that can
+ * only be known correctly once the one-time IndexedDB read has completed —
+ * mounting CodeMirror before then risks a flash of committed content that a
+ * staged edit is about to override.
  */
-export default function NoteEditor({
-  note,
-  notes,
-  repoFiles,
-}: {
-  note: EditableNote;
-  notes: NoteEntry[];
-  repoFiles: string[];
-}) {
+export default function NoteEditor(props: { note: EditableNote; notes: NoteEntry[]; repoFiles: string[] }) {
+  const staging = useStaging();
+  if (!staging.ready) return <LoadingPane />;
+  return <EditorPane {...props} />;
+}
+
+function LoadingPane() {
+  return (
+    <div className="flex flex-1 items-center justify-center p-8">
+      <p className="text-sm text-neutral-600">Loading staged changes…</p>
+    </div>
+  );
+}
+
+function EditorPane({ note, notes, repoFiles }: { note: EditableNote; notes: NoteEntry[]; repoFiles: string[] }) {
   const router = useRouter();
-  const [content, setContent] = useState(note.content);
-  const [status, setStatus] = useState<Status>('clean');
-  const [commit, setCommit] = useState<string | null>(null);
-  const [problem, setProblem] = useState<string | null>(null);
+  const staging = useStaging();
+  const record = staging.records[note.path];
+
+  const [content, setContent] = useState(() => effectiveContent(note.content, record));
+  const [status, setStatus] = useState<Status>(record ? 'pending' : 'clean');
   const [ambiguous, setAmbiguous] = useState<{ link: AmbiguousLink; x: number; y: number } | null>(null);
-  // What the server says is actually on disk right now, captured off a 409 —
-  // the two conflict actions below are the only things that read this.
-  const [conflictWith, setConflictWith] = useState<{ hash: string; content: string } | null>(null);
-  // Whether the "discarded your changes" undo toast is showing. The text it
-  // would restore lives in sessionStorage, not here — this is just the
-  // on/off switch for rendering it.
-  const [discardToast, setDiscardToast] = useState(false);
 
-  // Refs, not state: the debounce timer and the unmount flush need the newest
-  // values without waiting for a re-render.
-  const hash = useRef(note.hash);
-  const latest = useRef(note.content);
-  const onDisk = useRef(note.content);
+  // Refs, not state: the debounce timer and the unmount flush need the
+  // newest value without waiting for a re-render.
+  const latest = useRef(content);
+  // What was last actually staged (in-memory + IndexedDB) — distinct from
+  // `latest`, which tracks every keystroke. Lets the debounced/flushed
+  // `stage()` below skip a redundant write when nothing changed since the
+  // last one landed.
+  const lastStaged = useRef(content);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const commitCheck = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Mirrors `status` for effects that must read the latest value without
-  // taking a dependency on it — `status` flips on every keystroke, and this
-  // ref lets the focus-check listener below stay mounted across that churn
-  // instead of tearing down and re-adding on each character typed.
-  const statusRef = useRef<Status>(status);
-  useEffect(() => {
-    statusRef.current = status;
-  }, [status]);
-  // Set only while a "Keep mine" retry is in flight — tells the server this
-  // write is a conflict-resolution overwrite, so it must preserve whatever
-  // it's about to clobber first. Stays true across a failed retry (network
-  // error, or the server refusing because it couldn't preserve the other
-  // side) so hitting "Retry" doesn't silently drop the safety check; it is
-  // only cleared by a successful write or by a *fresh* conflict.
-  const resolvingConflict = useRef(false);
-  // Whether this note started life as a not-yet-on-disk stub (see the
-  // `?new=1` path in `page.tsx`) — the sidebar only has a client-side
-  // placeholder for it until the tree is refetched, so the first real write
-  // needs to trigger that refetch itself rather than waiting for the user
-  // to navigate somewhere and back.
-  const wasNew = useRef(note.hash === NEW_FILE_HASH);
 
-  const save = useCallback(async (flush = false) => {
-    const pending = latest.current;
-    if (pending === onDisk.current && !flush) return;
-
-    if (commitCheck.current) clearTimeout(commitCheck.current);
-    setStatus('saving');
-    try {
-      const response = await fetch('/api/note', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path: note.path,
-          content: pending,
-          baseHash: hash.current,
-          flush,
-          resolvingConflict: resolvingConflict.current,
-        }),
-      });
-      const data = await response.json();
-
-      if (response.status === 409) {
-        // A fresh conflict is a new situation — whatever the user picks next
-        // starts clean, not carrying over an in-flight "keep mine" intent.
-        resolvingConflict.current = false;
-        setStatus('conflict');
-        setProblem(data.message ?? 'This note changed somewhere else.');
-        setConflictWith({ hash: data.currentHash, content: data.currentContent });
-        return;
-      }
-      if (!response.ok) {
-        // Deliberately does NOT clear resolvingConflict here: if this was a
-        // "keep mine" retry that failed (network error, or the server
-        // refusing because it couldn't preserve the other side), the
-        // existing "Save failed → Retry" button must still resend it as a
-        // conflict resolution, not as a plain overwrite with the safety
-        // check silently dropped.
-        setStatus('error');
-        setProblem(data.error ?? 'Save failed.');
-        return;
-      }
-
-      resolvingConflict.current = false;
-      hash.current = data.hash;
-      onDisk.current = pending;
-      setProblem(data.commitError ?? null);
-      setCommit(data.commit ?? null);
-      setConflictWith(null);
-
-      if (wasNew.current) {
-        wasNew.current = false;
-        // The file is real now — hand the sidebar its authoritative row so
-        // it can drop the client-only placeholder, rather than leaving that
-        // placeholder up until some unrelated navigation happens to refetch.
-        router.refresh();
-      }
-
-      // Someone may have typed while the request was in flight.
-      if (latest.current !== pending) {
-        setStatus('editing');
-        return;
-      }
-      setStatus(data.commit ? 'committed' : 'onDisk');
-
-      // Not committed yet: the server is holding this note's session open and
-      // will write it to history once typing stops. Check back once.
-      if (!data.commit && data.pending) {
-        commitCheck.current = setTimeout(() => {
-          void fetch(`/api/note/status?path=${encodeURIComponent(note.path)}`)
-            .then((r) => r.json())
-            .then((state) => {
-              if (latest.current !== onDisk.current || state.pending || !state.commit) return;
-              setCommit(state.commit);
-              setStatus('committed');
-            })
-            .catch(() => undefined);
-        }, COMMIT_CHECK_MS);
-      }
-    } catch {
-      setStatus('error');
-      setProblem('Could not reach the server.');
+  const { stageEdit } = staging;
+  // The hash a fresh staged record should carry as its `baseHash`. Once a
+  // commit has landed for this note, `staging.noteHashes` holds the sha that
+  // write actually produced; `note.hash` (this component's original mount-time
+  // prop) would otherwise go stale the moment that happens, since nothing
+  // remounts this component when a commit lands elsewhere in the app.
+  const currentHash = staging.noteHashes[note.path] ?? note.hash;
+  const stage = useCallback(() => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
     }
-  }, [note.path, router]);
+    if (latest.current === lastStaged.current) return;
+    stageEdit(note.path, latest.current, currentHash);
+    lastStaged.current = latest.current;
+    setStatus('pending');
+  }, [stageEdit, note.path, currentHash]);
+
+  // A record can disappear out from under this component without it having
+  // triggered the change — a successful Commit (ticket 02) clears it once
+  // the content is safely in history. Reflect that instead of leaving the
+  // pill stuck on "Pending" for content that's no longer staged.
+  useEffect(() => {
+    if (!record && latest.current === lastStaged.current) setStatus('clean');
+  }, [record]);
 
   const onChange = (value: string) => {
     setContent(value);
     latest.current = value;
     setStatus('editing');
-    setProblem(null);
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => void save(), AUTOSAVE_DELAY_MS);
+    timer.current = setTimeout(stage, STAGE_DELAY_MS);
   };
 
-  // Ctrl+S flushes — it commits immediately instead of waiting out the idle
-  // window — but does not start a new commit. Plenty of people press it every
-  // few seconds out of habit, and treating that as a milestone would shred the
-  // log into a commit per reflex.
-  const saveNow = useCallback(() => {
-    if (timer.current) clearTimeout(timer.current);
-    void save(true);
-  }, [save]);
+  // Ctrl/Cmd-S stages immediately instead of waiting out the debounce.
+  // There's no server round trip to skip here — this only shortens the
+  // local delay before the pending indicator (and IndexedDB) catch up.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        stage();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [stage]);
 
-  // The two ways out of a conflict — both explicit, neither silent. Retrying
-  // with the same stale hash would just 409 again forever, so both first
-  // adopt the hash the server just proved is current.
-  const keepMine = useCallback(() => {
-    if (!conflictWith) return;
-    hash.current = conflictWith.hash;
-    resolvingConflict.current = true;
-    setConflictWith(null);
-    saveNow();
-  }, [conflictWith, saveNow]);
-
-  const loadTheirs = useCallback(() => {
-    if (!conflictWith) return;
-    // Stash what's about to be discarded so a reflexive click has a way
-    // back — see the undo toast below. Best-effort: a full sessionStorage
-    // quota or a private-browsing restriction shouldn't block resolving the
-    // conflict itself.
-    try {
-      sessionStorage.setItem(discardKeyFor(note.path), latest.current);
-    } catch {
-      // Nothing to recover from here — proceed without the safety net.
-    }
-    hash.current = conflictWith.hash;
-    onDisk.current = conflictWith.content;
-    latest.current = conflictWith.content;
-    resolvingConflict.current = false;
-    setContent(conflictWith.content);
-    setConflictWith(null);
-    setProblem(null);
-    setStatus('onDisk');
-    setDiscardToast(true);
-  }, [conflictWith, note.path]);
-
-  // Brings back text discarded by "Load theirs", as a fresh edit on top of
-  // the server version that was just adopted — not a rewind of hash/onDisk,
-  // so the next autosave writes cleanly with no re-conflict.
-  const undoDiscard = useCallback(() => {
-    setDiscardToast(false);
-    const key = discardKeyFor(note.path);
-    const saved = sessionStorage.getItem(key);
-    sessionStorage.removeItem(key);
-    if (saved === null) return; // toast already expired and cleared it
-    latest.current = saved;
-    setContent(saved);
-    setProblem(null);
-    setStatus('editing');
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => void save(), AUTOSAVE_DELAY_MS);
-  }, [note.path, save]);
-
-  const dismissDiscardToast = useCallback(() => {
-    setDiscardToast(false);
-    sessionStorage.removeItem(discardKeyFor(note.path));
-  }, [note.path]);
+  // Leaving for another note, hiding the tab, or closing it must not drop
+  // the last few keystrokes. Unlike the old autosave path, this never needs
+  // `keepalive` — it's a local IndexedDB write, not a network request that
+  // the browser would cancel on unload.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') stage();
+    };
+    document.addEventListener('visibilitychange', onHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onHide);
+      stage();
+    };
+  }, [stage]);
 
   // Recomputed on every keystroke — parsing+resolving one note's handful of
   // links against ~40 paths is trivial, no debounce needed here (the
@@ -321,159 +203,6 @@ export default function NoteEditor({
     [linkCtx, note.path],
   );
 
-  // Ctrl/Cmd-S saves now instead of waiting out the debounce. The browser's own
-  // "save page" dialog is never what someone means inside a text editor.
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
-        event.preventDefault();
-        saveNow();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [saveNow]);
-
-  // Leaving for another note, or closing the tab, must not drop the last few
-  // keystrokes — and must not leave the work sitting outside history either.
-  // `keepalive` lets the request outlive the component; `flush` tells the
-  // server to commit rather than start a 15s timer nobody is waiting on.
-  useEffect(() => {
-    const path = note.path;
-    const flushOut = () => {
-      // Nothing new to flush since the last successful write — most
-      // consequential for a brand-new note (`note.hash` is the sentinel
-      // `NEW_FILE_HASH`), where flushing here would create and commit an
-      // empty file before the user typed a single character. React's Strict
-      // Mode deliberately mounts, unmounts, and remounts every component in
-      // dev specifically to catch a missing guard like this — it did, on the
-      // very first real use of Create. Harmless-but-redundant for an
-      // existing, untouched note too, so the guard is unconditional rather
-      // than sentinel-specific.
-      if (latest.current === onDisk.current) return;
-
-      void fetch('/api/note', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path,
-          content: latest.current,
-          baseHash: hash.current,
-          flush: true,
-        }),
-        keepalive: true,
-      });
-    };
-
-    const onHide = () => {
-      if (document.visibilityState === 'hidden') flushOut();
-    };
-    document.addEventListener('visibilitychange', onHide);
-
-    return () => {
-      document.removeEventListener('visibilitychange', onHide);
-      if (timer.current) clearTimeout(timer.current);
-      if (commitCheck.current) clearTimeout(commitCheck.current);
-      flushOut();
-    };
-  }, [note.path]);
-
-  // A discarded-edits stash only makes sense for as long as its toast is
-  // visible (see `loadTheirs`/`undoDiscard` above) — once this note is
-  // navigated away from, there is no UI left that will ever read the key
-  // back, so leaving it behind would just be an orphaned entry for the rest
-  // of the tab's life.
-  useEffect(() => {
-    const path = note.path;
-    return () => {
-      sessionStorage.removeItem(discardKeyFor(path));
-    };
-  }, [note.path]);
-
-  // Catches a note that changed on disk *before* the user's next keystroke
-  // would discover it via a failed autosave — same-browser multi-tab is the
-  // case this targets: leave a note open in one tab, edit and save it from
-  // another, then come back. Deliberately focus/visibility-triggered only,
-  // not a periodic poll: no background chatter while the tab just sits idle.
-  useEffect(() => {
-    const path = note.path;
-    let cancelled = false;
-    let inFlight = false;
-
-    const checkStaleness = () => {
-      if (document.visibilityState !== 'visible') return;
-      if (inFlight) return;
-      // A save or an already-open conflict dialog is already handling
-      // whatever the current state is; a fresh discard toast is also
-      // deliberately quiet for its short window (see the guard below).
-      if (statusRef.current === 'saving' || statusRef.current === 'conflict') return;
-      if (discardToast) return;
-      // A not-yet-created note (the `?new=1` path) has nothing server-side
-      // to compare against yet.
-      if (hash.current === NEW_FILE_HASH) return;
-
-      inFlight = true;
-      fetch(`/api/note/status?path=${encodeURIComponent(path)}`)
-        .then((r) => r.json() as Promise<NoteStatus>)
-        .then(async (state) => {
-          if (cancelled) return;
-
-          if (state.hash === null) {
-            // Deleted elsewhere — don't guess, don't silently blank the
-            // editor. Surface it the same way any other unrecoverable save
-            // problem is surfaced.
-            setStatus('error');
-            setProblem('This note was deleted elsewhere.');
-            return;
-          }
-          if (state.hash === hash.current) return; // still current
-
-          const isClean = latest.current === onDisk.current;
-          if (timer.current) {
-            clearTimeout(timer.current);
-            timer.current = null;
-          }
-
-          const response = await fetch(`/api/note?path=${encodeURIComponent(path)}`);
-          if (cancelled) return;
-          if (!response.ok) {
-            // The gap between the two requests is small but real (e.g. a
-            // delete landing in between) — fail the same way as an
-            // already-missing note rather than adopting an undefined hash.
-            setStatus('error');
-            setProblem('This note was deleted elsewhere.');
-            return;
-          }
-          const fresh = await response.json();
-
-          if (isClean) {
-            hash.current = fresh.hash;
-            onDisk.current = fresh.content;
-            latest.current = fresh.content;
-            setContent(fresh.content);
-            setCommit(state.commit);
-            setStatus(state.commit && !state.pending ? 'committed' : 'onDisk');
-          } else {
-            setConflictWith({ hash: fresh.hash, content: fresh.content });
-            setProblem('This note changed somewhere else.');
-            setStatus('conflict');
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          inFlight = false;
-        });
-    };
-
-    document.addEventListener('visibilitychange', checkStaleness);
-    window.addEventListener('focus', checkStaleness);
-    return () => {
-      cancelled = true;
-      document.removeEventListener('visibilitychange', checkStaleness);
-      window.removeEventListener('focus', checkStaleness);
-    };
-  }, [note.path, discardToast]);
-
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-start justify-between gap-6 px-10 pt-7 pb-4">
@@ -483,7 +212,7 @@ export default function NoteEditor({
         </div>
         <div className="flex shrink-0 items-center gap-3">
           <LinksMenu links={links} notes={notes} />
-          <SaveStatus status={status} commit={commit} problem={problem} onRetry={saveNow} />
+          <StagingStatus status={status} />
         </div>
       </header>
 
@@ -521,18 +250,6 @@ export default function NoteEditor({
           onDismiss={() => setAmbiguous(null)}
         />
       )}
-
-      {status === 'conflict' && conflictWith && (
-        <ConflictDialog
-          path={note.path}
-          mine={content}
-          theirs={conflictWith.content}
-          onKeepMine={keepMine}
-          onLoadTheirs={loadTheirs}
-        />
-      )}
-
-      {discardToast && <DiscardToast onUndo={undoDiscard} onDismiss={dismissDiscardToast} />}
     </div>
   );
 }
@@ -556,23 +273,11 @@ function Breadcrumb({ path }: { path: string }) {
  * The first of the three interface moments the brief names: can the user tell,
  * without thinking, whether their work is safe?
  *
- * There are two real guarantees here, so the pill shows two, quietly. "Saved
- * to disk" means the text survives a closed laptop. "Committed" means it is in
- * the permanent record and can be recovered later. Collapsing both into
- * "Saved" would be simpler and would claim more than the app has done at that
- * instant.
+ * Only one durability guarantee exists now: held locally, surviving a reload,
+ * not yet part of the note's real history. "Committed" (ticket 02) is a
+ * separate, later promise this pill doesn't make yet.
  */
-function SaveStatus({
-  status,
-  commit,
-  problem,
-  onRetry,
-}: {
-  status: Status;
-  commit: string | null;
-  problem: string | null;
-  onRetry: () => void;
-}) {
+function StagingStatus({ status }: { status: Status }) {
   if (status === 'clean') return null;
 
   const pill = 'flex shrink-0 items-center gap-2 rounded-full px-2.5 py-1 font-mono text-xs';
@@ -586,61 +291,14 @@ function SaveStatus({
     );
   }
 
-  if (status === 'saving') {
-    return (
-      <p className={`${pill} bg-blue-500/10 text-blue-400`} role="status">
-        <span className="size-1.5 animate-ping rounded-full bg-blue-400" />
-        Saving to disk…
-      </p>
-    );
-  }
-
-  if (status === 'onDisk') {
-    return (
-      <p
-        className={`${pill} bg-neutral-800 text-neutral-300`}
-        role="status"
-        title="Your text is on disk. It is not yet part of the note's history."
-      >
-        <span className="size-1.5 rounded-full bg-blue-400" />
-        Saved to disk
-      </p>
-    );
-  }
-
-  if (status === 'committed') {
-    return (
-      <p
-        className={`${pill} bg-emerald-500/10 text-emerald-400`}
-        role="status"
-        title="Recorded in this note's history — recoverable later."
-      >
-        <span className="size-1.5 rounded-full bg-emerald-400" />
-        Committed · <code>{commit}</code>
-      </p>
-    );
-  }
-
-  // Resolving the conflict itself happens in the blocking `ConflictDialog`,
-  // not here — this pill is just the ambient status readout, same as every
-  // other state above. A pill alone was too easy to miss (top-right corner,
-  // small text) for something that can lose unsaved work if ignored.
-  if (status === 'conflict') {
-    return (
-      <p className={`${pill} bg-red-500/10 text-red-400`} role="status" title={problem ?? undefined}>
-        <span className="size-1.5 rounded-full bg-red-400" />
-        Changed elsewhere
-      </p>
-    );
-  }
-
   return (
-    <p className={`${pill} bg-red-500/10 text-red-400`} role="status" title={problem ?? undefined}>
-      <span className="size-1.5 rounded-full bg-red-400" />
-      Save failed
-      <button type="button" onClick={onRetry} className="ml-1 underline hover:text-red-300">
-        Retry
-      </button>
+    <p
+      className={`${pill} bg-neutral-800 text-neutral-300`}
+      role="status"
+      title="Held locally, survives a reload. Not part of this note's history until you commit."
+    >
+      <span className="size-1.5 rounded-full bg-blue-400" />
+      Pending
     </p>
   );
 }

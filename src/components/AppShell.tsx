@@ -9,11 +9,13 @@ import LinkImpactModal from '@/components/LinkImpactModal';
 import MoveToDialog from '@/components/MoveToDialog';
 import NoteTree, { type PendingCreate } from '@/components/NoteTree';
 import RowContextMenu from '@/components/RowContextMenu';
+import { useStaging } from '@/components/staging/StagingProvider';
 import Toast from '@/components/Toast';
 import TrashPanel, { type TrashEntry } from '@/components/TrashPanel';
 import type { FixableLink, UnfixableLink } from '@/lib/links/rewrite';
 import type { Backlink } from '@/lib/links/types';
 import { dirName, baseName, renameVerb } from '@/lib/paths';
+import { pendingCountOf } from '@/lib/staging/fold';
 import { filePathsOf, folderPathsOf, withClientFile, withClientFolder, type TreeNode } from '@/lib/tree';
 
 type LinkImpactState = {
@@ -74,6 +76,8 @@ export default function AppShell({
   children: React.ReactNode;
 }) {
   const router = useRouter();
+  const staging = useStaging();
+  const pendingCount = pendingCountOf(staging.records);
 
   const [selectedFolder, setSelectedFolder] = useState('notes');
   const [pendingCreate, setPendingCreate] = useState<PendingCreate>(null);
@@ -108,6 +112,16 @@ export default function AppShell({
   // only ever one restore in flight regardless of which one triggered it.
   const [restoringSha, setRestoringSha] = useState<string | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [committing, setCommitting] = useState(false);
+  // Keyed by staged identity — set only for ops that failed and are still
+  // staged afterward (per ticket 02's "the reason must be visible, not
+  // silent" requirement). Cleared as soon as that identity commits
+  // successfully or is edited again.
+  const [commitErrors, setCommitErrors] = useState<Record<string, string>>({});
+  // Distinct from `commitErrors` (per-note, from a partially-successful
+  // batch): this is for the request itself failing outright (network error,
+  // malformed response) before any per-op result exists to show.
+  const [commitBatchError, setCommitBatchError] = useState<string | null>(null);
 
   // Both graduate to real the moment the server-fetched tree already
   // contains them — drop the ephemeral copy rather than showing it twice.
@@ -150,6 +164,9 @@ export default function AppShell({
       return;
     }
     setPendingFile(path);
+    // Staged the moment the name is confirmed, not on the first keystroke —
+    // an empty new note is still a pending create (ticket 03).
+    staging.stageCreate(path);
     router.push(`/?path=${encodeURIComponent(path)}&new=1`);
   };
 
@@ -159,16 +176,16 @@ export default function AppShell({
     setContextMenu(null);
   };
 
-  // The actual `git mv` + commit, shared by the no-impact fast path and both
-  // of the link-impact modal's non-cancel buttons.
-  const performRename = async (oldPath: string, newPath: string, rewriteLinks: boolean) => {
-    await requestJson('/api/note/rename', { oldPath, newPath, rewriteLinks });
+  // Stages the rename/move — shared by the no-impact fast path and both of
+  // the link-impact modal's non-cancel buttons. No real `git mv` happens
+  // here (ticket 04); that's Commit's job. Deliberately does not navigate
+  // to `newPath` even when the renamed note is open: nothing exists there
+  // on disk yet, and resolving a staged-renamed path is ticket 07's job —
+  // the editor just keeps showing the note at its still-real `oldPath`
+  // until the rename is committed.
+  const performRename = (oldPath: string, newPath: string, rewriteLinks: boolean) => {
+    staging.stageRename(oldPath, newPath, rewriteLinks);
     setLinkImpact(null);
-    if (selected === oldPath) {
-      router.push(`/?path=${encodeURIComponent(newPath)}`);
-    } else {
-      router.refresh();
-    }
   };
 
   // The one entry point for "change this note's path," shared by inline
@@ -249,23 +266,78 @@ export default function AppShell({
     }
   };
 
-  const confirmDelete = async () => {
+  // Stages the delete (ticket 05) — no real `git rm` happens here, and so
+  // no commit sha exists yet to offer the toast's Undo against. The toast
+  // below stays wired to `/api/note/restore`, for reverting a delete that
+  // has actually landed (via Commit); backing out a merely-*staged* delete
+  // is Discard's job (ticket 09), not this dialog's.
+  const confirmDelete = () => {
     if (!deleteTarget) return;
-    const { path } = deleteTarget;
-    setDeleteTarget({ ...deleteTarget, busy: true, error: null });
+    staging.stageDelete(deleteTarget.path);
+    setDeleteTarget(null);
+  };
+
+  // Replays every staged edit through the real save pipeline
+  // (`/api/note/commit`, which reuses `writeNote`/`sessions.ts` unchanged).
+  // Each staged identity is independent server-side, so a batch of three
+  // where one has gone stale still lands the other two — this just sorts
+  // the per-op results back into "clear it" or "keep it staged, with why."
+  type CommitOpResult =
+    | { path: string; ok: true; commit: string | null; hash: string; title: string; newPath?: string }
+    | { path: string; ok: false; error: string };
+
+  const handleCommit = async () => {
+    const ops = Object.values(staging.records)
+      .filter((record) => record.content !== undefined || record.newPath !== undefined || record.op === 'delete')
+      .map((record) => ({
+        path: record.id,
+        content: record.content,
+        baseHash: record.baseHash ?? '',
+        newPath: record.newPath,
+        rewriteLinks: record.rewriteLinks,
+        delete: record.op === 'delete' || undefined,
+      }));
+    if (ops.length === 0 || committing) return;
+
+    setCommitting(true);
+    setCommitBatchError(null);
     try {
-      const result = await requestJson<{ sha: string; title: string }>('/api/note/delete', { path });
-      setDeleteTarget(null);
-      setToast({ sha: result.sha, title: result.title });
-      if (selected === path) {
-        router.push('/');
-      } else {
+      const { results } = await requestJson<{ results: CommitOpResult[] }>('/api/note/commit', { ops });
+
+      const succeeded: string[] = [];
+      const failed: Record<string, string> = {};
+      let renamedSelectedTo: string | null = null;
+      for (const result of results) {
+        if (result.ok) {
+          succeeded.push(result.path);
+          // No hash to track for a deleted note — nothing exists to stage
+          // further edits against.
+          if (result.hash) staging.setNoteHash(result.newPath ?? result.path, result.hash);
+          if (result.newPath && selected === result.path) renamedSelectedTo = result.newPath;
+        } else {
+          failed[result.path] = result.error;
+        }
+      }
+      staging.clearStaged(succeeded);
+      setCommitErrors((prev) => {
+        const next = { ...prev };
+        for (const path of succeeded) delete next[path];
+        return { ...next, ...failed };
+      });
+      // Titles and disk hashes may have changed for whatever just landed —
+      // most consequential for the currently open note, whose committed
+      // content needs to stop being shadowed by a staged record that no
+      // longer exists. A rename of the currently open note is now real on
+      // disk, so it's safe to navigate to it — unlike at staging time.
+      if (renamedSelectedTo) {
+        router.push(`/?path=${encodeURIComponent(renamedSelectedTo)}`);
+      } else if (succeeded.length > 0) {
         router.refresh();
       }
     } catch (error) {
-      setDeleteTarget((prev) =>
-        prev ? { ...prev, busy: false, error: error instanceof Error ? error.message : 'Delete failed.' } : prev,
-      );
+      setCommitBatchError(error instanceof Error ? error.message : 'Commit failed.');
+    } finally {
+      setCommitting(false);
     }
   };
 
@@ -294,7 +366,20 @@ export default function AppShell({
         <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b border-line bg-surface px-3.5 py-3">
           <div className="min-w-0">
             <p className="text-sm font-semibold text-neutral-200">Notes</p>
-            <p className="text-xs text-neutral-500">{noteCount} notes</p>
+            <p className="text-xs text-neutral-500">
+              {noteCount} notes
+              {pendingCount > 0 && (
+                <>
+                  {' · '}
+                  <span
+                    className="text-blue-400"
+                    title="Staged locally, not yet committed."
+                  >
+                    {pendingCount} pending
+                  </span>
+                </>
+              )}
+            </p>
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <button
@@ -326,6 +411,18 @@ export default function AppShell({
             </button>
           </div>
         </div>
+        {pendingCount > 0 && (
+          <div className="border-b border-line px-3.5 py-2">
+            <button
+              type="button"
+              onClick={handleCommit}
+              disabled={committing}
+              className="w-full rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-60"
+            >
+              {committing ? 'Committing…' : `Commit ${pendingCount} pending change${pendingCount === 1 ? '' : 's'}`}
+            </button>
+          </div>
+        )}
         {renameError && (
           <div className="flex items-start justify-between gap-2 border-b border-line bg-red-500/10 px-3.5 py-2">
             <p className="text-xs text-red-400">{renameError}</p>
@@ -337,6 +434,38 @@ export default function AppShell({
             >
               ×
             </button>
+          </div>
+        )}
+        {commitBatchError && (
+          <div className="flex items-start justify-between gap-2 border-b border-line bg-red-500/10 px-3.5 py-2">
+            <p className="text-xs text-red-400">{commitBatchError}</p>
+            <button
+              type="button"
+              onClick={() => setCommitBatchError(null)}
+              aria-label="Dismiss"
+              className="shrink-0 text-xs text-red-400/70 hover:text-red-400"
+            >
+              ×
+            </button>
+          </div>
+        )}
+        {Object.keys(commitErrors).length > 0 && (
+          <div className="space-y-1 border-b border-line bg-red-500/10 px-3.5 py-2">
+            {Object.entries(commitErrors).map(([path, error]) => (
+              <div key={path} className="flex items-start justify-between gap-2">
+                <p className="min-w-0 text-xs text-red-400">
+                  <span className="font-mono">{baseName(path)}</span> didn&apos;t commit: {error}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setCommitErrors((prev) => { const next = { ...prev }; delete next[path]; return next; })}
+                  aria-label="Dismiss"
+                  className="shrink-0 text-xs text-red-400/70 hover:text-red-400"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
           </div>
         )}
         <NoteTree
